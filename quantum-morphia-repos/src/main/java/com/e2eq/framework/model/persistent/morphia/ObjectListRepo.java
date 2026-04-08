@@ -10,6 +10,7 @@ import org.apache.commons.lang3.NotImplementedException;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jetbrains.annotations.NotNull;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 
@@ -54,6 +55,9 @@ public class ObjectListRepo<
     public List<O> getObjectsForList(StaticDynamicList<O> staticDynamicList, List<O> objects) {
         if (staticDynamicList.isStatic()) {
             objects = staticDynamicList.getItems();
+            if (objects == null) {
+                objects = new ArrayList<>();
+            }
         } else if (staticDynamicList.isDynamic()) {
             String filterString = staticDynamicList.getFilterString();
             objects = objectRepo.getListByQuery(0, -1, filterString, null, null);
