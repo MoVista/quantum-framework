@@ -35,6 +35,9 @@ public class CredentialRepo extends MorphiaRepo<CredentialUserIdPassword> {
    @Inject
    RealmRepo realmRepo;
 
+   @Inject
+   com.e2eq.framework.util.SecurityUtils securityUtils;
+
    @Override
    public String getDatabaseName () {
       //return morphiaDataStore.getDataStore(securityUtils.getSystemRealm()).getDatabase().getName();
@@ -59,49 +62,18 @@ public class CredentialRepo extends MorphiaRepo<CredentialUserIdPassword> {
       }
       var pctx = pctxOpt.get();
       String userId = pctx.getUserId();
-      String defaultRealm = pctx.getDefaultRealm();
 
-      Optional<CredentialUserIdPassword> ocred = findByUserId(userId, defaultRealm, true);
+      Optional<CredentialUserIdPassword> ocred = findByUserId(userId, envConfigUtils.getSystemRealm(), true);
       if (ocred.isEmpty()) {
          return java.util.Collections.emptyList();
       }
 
       CredentialUserIdPassword credential = ocred.get();
-      String realmRegex = credential.getRealmRegEx();
-      List<CredentialUserIdPassword.RealmEntry> authorizedRealms = credential.getAuthorizedRealms();
 
-      java.util.Set<String> matches = new java.util.LinkedHashSet<>();
+      List<Realm> realms = realmRepo.getAllListWithIgnoreRules(envConfigUtils.getSystemRealm());
+      List<String> candidateRefNames = realms.stream().map(Realm::getRefName).collect(java.util.stream.Collectors.toList());
 
-      // 1. Add explicitly authorized realms
-      if (authorizedRealms != null) {
-         for (var entry : authorizedRealms) {
-            if (entry.getRealmRefName() != null && !entry.getRealmRefName().isBlank()) {
-               matches.add(entry.getRealmRefName());
-            }
-         }
-      }
-
-      // 2. Add realms matching the regex
-      if (realmRegex != null && !realmRegex.isBlank()) {
-         String patternText = "*".equals(realmRegex) ? ".*" : realmRegex;
-         java.util.regex.Pattern pattern;
-         try {
-            pattern = java.util.regex.Pattern.compile(patternText);
-         } catch (Exception e) {
-            // Fallback to exact match if invalid regex provided
-            pattern = java.util.regex.Pattern.compile(java.util.regex.Pattern.quote(realmRegex));
-         }
-
-         List<Realm> realms = realmRepo.getAllList(envConfigUtils.getSystemRealm());
-         for (var r : realms) {
-            String realmId = r.getDatabaseName();
-            if (realmId != null && pattern.matcher(realmId).matches()) {
-               matches.add(realmId);
-            }
-         }
-      }
-
-      return new java.util.ArrayList<>(matches);
+      return securityUtils.computeAllowedRealmRefNames(credential, candidateRefNames);
    }
 
    /**
