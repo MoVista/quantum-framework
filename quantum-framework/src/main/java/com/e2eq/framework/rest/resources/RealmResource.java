@@ -102,7 +102,6 @@ public class RealmResource extends BaseResource<Realm, BaseMorphiaRepo<Realm>> {
    @Produces({ "application/json"})
    @Consumes({"application/json"})
    @RolesAllowed({"user", "admin", "system"})
-   @com.e2eq.framework.annotations.FunctionalAction(value = "VIEW", bypassDataScoping = true)
    public Response accessible(@QueryParam("userId") String userId, @QueryParam("subjectId") String subjectId) {
       if ((userId == null || userId.isBlank()) && (subjectId == null || subjectId.isBlank())) {
          RestError error = RestError.builder()
