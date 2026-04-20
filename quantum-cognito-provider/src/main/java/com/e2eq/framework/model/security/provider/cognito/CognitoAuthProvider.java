@@ -1392,8 +1392,7 @@ public class CognitoAuthProvider extends BaseAuthProvider implements AuthProvide
    @Override
    public void resendTemporaryPassword(String userId) throws SecurityException {
       if (isCognitoDisabled()) {
-         Log.debug("Cognito disabled: skipping resend temporary password");
-         return;
+         throw new java.lang.UnsupportedOperationException("Cognito is disabled; cannot resend temporary password");
       }
 
       Optional<CredentialUserIdPassword> ocred = credentialRepo.findByUserId(userId, envConfigUtils.getSystemRealm(), true);
