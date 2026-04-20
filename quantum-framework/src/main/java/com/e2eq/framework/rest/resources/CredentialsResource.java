@@ -169,6 +169,7 @@ public class CredentialsResource extends BaseResource<CredentialUserIdPassword, 
     @RolesAllowed({ "user", "admin", "system" })
     @Produces(MediaType.APPLICATION_JSON)
     @Operation(summary = "Get matching realms for current user")
+    @com.e2eq.framework.annotations.FunctionalAction(value = "VIEW", bypassDataScoping = true)
     public Response getMatchingRealms() {
         List<String> realms = repo.getMatchingRealmsForCurrentUser();
         return Response.ok(realms).build();
