@@ -7,6 +7,7 @@ import com.e2eq.framework.model.security.CredentialType;
 import com.e2eq.framework.rest.models.ChangePasswordRequest;
 import com.e2eq.framework.rest.models.FileUpload;
 import com.e2eq.framework.rest.models.RestError;
+import com.e2eq.framework.rest.models.SuccessResponse;
 import com.e2eq.framework.model.security.CredentialUserIdPassword;
 import com.e2eq.framework.model.persistent.morphia.CredentialRepo;
 import jakarta.inject.Inject;
@@ -114,27 +115,36 @@ public class CredentialsResource extends BaseResource<CredentialUserIdPassword, 
             @QueryParam("provider") @DefaultValue("") String provider) {
 
         if (userId == null || userId.isBlank()) {
-            return Response.status(Response.Status.BAD_REQUEST)
-                    .entity(java.util.Map.of("error", "userId is required"))
+            RestError error = RestError.builder()
+                    .status(Response.Status.BAD_REQUEST.getStatusCode())
+                    .statusMessage("userId is required")
                     .build();
+            return Response.status(Response.Status.BAD_REQUEST).entity(error).build();
         }
 
         try {
             UserManagement userManager = resolveUserManager(userId, provider);
             userManager.resendTemporaryPassword(userId);
         } catch (UnsupportedOperationException e) {
-            return Response.status(Response.Status.BAD_REQUEST)
-                    .entity(java.util.Map.of("error", "Resending temporary password is not supported by the auth provider: " + e.getMessage()))
+            RestError error = RestError.builder()
+                    .status(Response.Status.BAD_REQUEST.getStatusCode())
+                    .statusMessage("Resending temporary password is not supported by the auth provider")
+                    .reasonMessage(e.getMessage())
                     .build();
+            return Response.status(Response.Status.BAD_REQUEST).entity(error).build();
         } catch (Exception e) {
-            return Response.status(Response.Status.INTERNAL_SERVER_ERROR)
-                    .entity(java.util.Map.of("error", "Failed to resend temporary password: " + e.getMessage()))
+            RestError error = RestError.builder()
+                    .status(Response.Status.INTERNAL_SERVER_ERROR.getStatusCode())
+                    .statusMessage("Failed to resend temporary password")
+                    .reasonMessage(e.getMessage())
                     .build();
+            return Response.status(Response.Status.INTERNAL_SERVER_ERROR).entity(error).build();
         }
 
-        return Response.status(Response.Status.OK)
-                .entity(java.util.Map.of("message", "Temporary password resent successfully"))
-                .build();
+        SuccessResponse success = new SuccessResponse();
+        success.setStatusCode(Response.Status.OK.getStatusCode());
+        success.setMessage("Temporary password resent successfully");
+        return Response.ok().entity(success).build();
     }
 
     private UserManagement resolveUserManager(String userId, String requestedProvider) {
