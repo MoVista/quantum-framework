@@ -18,6 +18,8 @@ import org.eclipse.microprofile.openapi.annotations.Operation;
 import org.eclipse.microprofile.openapi.annotations.parameters.Parameter;
 import org.eclipse.microprofile.openapi.annotations.tags.Tag;
 
+import com.e2eq.framework.rest.models.RealmInfo;
+
 import java.util.List;
 import java.util.Optional;
 
@@ -181,7 +183,7 @@ public class CredentialsResource extends BaseResource<CredentialUserIdPassword, 
     @Operation(summary = "Get matching realms for current user")
     @com.e2eq.framework.annotations.FunctionalAction(value = "VIEW", bypassDataScoping = true)
     public Response getMatchingRealms() {
-        List<String> realms = repo.getMatchingRealmsForCurrentUser();
+        List<RealmInfo> realms = repo.getMatchingRealmsForCurrentUser();
         return Response.ok(realms).build();
     }
 }

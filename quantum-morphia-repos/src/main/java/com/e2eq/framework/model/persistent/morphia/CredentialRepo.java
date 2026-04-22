@@ -25,7 +25,9 @@ import org.jetbrains.annotations.Nullable;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.stream.Collectors;
 
 @ApplicationScoped
 public class CredentialRepo extends MorphiaRepo<CredentialUserIdPassword> {
@@ -45,17 +47,16 @@ public class CredentialRepo extends MorphiaRepo<CredentialUserIdPassword> {
    }
 
    /**
-    * Returns the list of realm IDs (database names) that match the current user's realmRegEx
+    * Returns the list of realms that match the current user's realmRegEx
     * or are explicitly listed in the authorizedRealms list.
+    * Each entry carries the realm's {@code refName} and {@code tenantId}.
     * The current user is resolved from SecurityContext's PrincipalContext. The set of candidate
     * realms is obtained from the realm catalog stored in the system realm.
     *
-    * Behavior:
-    * - If the user cannot be resolved or no credential is found, returns an empty list.
-    * - Matches are combined from both authorizedRealms and realmRegEx.
-    * - If realmRegEx is "*", matches all realms.
+    * @return matching realms as lightweight {@link com.e2eq.framework.rest.models.RealmInfo} projections;
+    *         empty list when the user cannot be resolved or no credential is found.
     */
-   public List<String> getMatchingRealmsForCurrentUser() {
+   public List<com.e2eq.framework.rest.models.RealmInfo> getMatchingRealmsForCurrentUser() {
       var pctxOpt = com.e2eq.framework.model.securityrules.SecurityContext.getPrincipalContext();
       if (pctxOpt.isEmpty()) {
          return java.util.Collections.emptyList();
@@ -71,9 +72,26 @@ public class CredentialRepo extends MorphiaRepo<CredentialUserIdPassword> {
       CredentialUserIdPassword credential = ocred.get();
 
       List<Realm> realms = realmRepo.getAllListWithIgnoreRules(envConfigUtils.getSystemRealm());
-      List<String> candidateRefNames = realms.stream().map(Realm::getRefName).collect(java.util.stream.Collectors.toList());
+      List<String> candidateRefNames = realms.stream().map(Realm::getRefName).collect(Collectors.toList());
 
-      return securityUtils.computeAllowedRealmRefNames(credential, candidateRefNames);
+      List<String> allowedRefNames = securityUtils.computeAllowedRealmRefNames(credential, candidateRefNames);
+
+      Map<String, Realm> realmByRefName = realms.stream()
+              .collect(Collectors.toMap(
+                      r -> r.getRefName().toLowerCase(),
+                      r -> r,
+                      (a, b) -> a
+              ));
+
+      return allowedRefNames.stream()
+              .map(refName -> {
+                 Realm r = realmByRefName.get(refName.toLowerCase());
+                 String tenantId = (r != null && r.getDomainContext() != null)
+                         ? r.getDomainContext().getTenantId()
+                         : null;
+                 return new com.e2eq.framework.rest.models.RealmInfo(refName, tenantId);
+              })
+              .collect(Collectors.toList());
    }
 
    /**
