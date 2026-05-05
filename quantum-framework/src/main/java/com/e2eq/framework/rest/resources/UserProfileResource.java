@@ -18,6 +18,8 @@ import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 import org.eclipse.microprofile.openapi.annotations.tags.Tag;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
 
 @Path("/user/userProfile")
@@ -116,6 +118,19 @@ public class UserProfileResource extends BaseResource<UserProfile, UserProfileRe
          Optional<CredentialUserIdPassword> ocred = credentialRepo.findByUserId(createUserRequest.getUserId());
          if (!ocred.isPresent())
             throw new IllegalStateException(String.format("User created but credential not found for userId: %s", createUserRequest.getUserId()));
+
+         // Set authorizedRealms so the user can access the realm they were created for
+         String realmRefName = createUserRequest.getDomainContext().getDefaultRealm();
+         if (realmRefName != null && !realmRefName.isBlank()) {
+            CredentialUserIdPassword cred = ocred.get();
+            CredentialUserIdPassword.RealmEntry realmEntry = new CredentialUserIdPassword.RealmEntry();
+            realmEntry.setRealmRefName(realmRefName);
+            List<CredentialUserIdPassword.RealmEntry> realms = new ArrayList<>();
+            realms.add(realmEntry);
+            cred.setAuthorizedRealms(realms);
+            credentialRepo.save(cred);
+            ocred = Optional.of(cred);
+         }
 
 
          up = UserProfile.builder()
