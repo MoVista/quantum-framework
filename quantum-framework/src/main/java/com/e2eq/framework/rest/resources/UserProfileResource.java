@@ -2,9 +2,7 @@ package com.e2eq.framework.rest.resources;
 
 import com.e2eq.framework.model.persistent.base.ActiveStatus;
 import com.e2eq.framework.model.persistent.morphia.CredentialRepo;
-import com.e2eq.framework.model.persistent.morphia.RealmRepo;
 import com.e2eq.framework.model.security.CredentialUserIdPassword;
-import com.e2eq.framework.model.security.Realm;
 import com.e2eq.framework.model.auth.AuthProviderFactory;
 import com.e2eq.framework.rest.filters.PermissionCheck;
 import com.e2eq.framework.rest.models.RestError;
@@ -34,9 +32,6 @@ public class UserProfileResource extends BaseResource<UserProfile, UserProfileRe
 
    @Inject
    protected CredentialRepo credentialRepo;
-
-   @Inject
-   protected RealmRepo realmRepo;
 
    protected UserProfileResource (UserProfileRepo repo ) {
       super(repo);
@@ -130,8 +125,6 @@ public class UserProfileResource extends BaseResource<UserProfile, UserProfileRe
             CredentialUserIdPassword cred = ocred.get();
             CredentialUserIdPassword.RealmEntry realmEntry = new CredentialUserIdPassword.RealmEntry();
             realmEntry.setRealmRefName(realmRefName);
-            Optional<Realm> orealm = realmRepo.findByRefName(realmRefName, true);
-            realmEntry.setRealmDisplayName(orealm.map(Realm::getDisplayName).orElse(realmRefName));
             List<CredentialUserIdPassword.RealmEntry> realms = new ArrayList<>();
             realms.add(realmEntry);
             cred.setAuthorizedRealms(realms);
