@@ -4,6 +4,7 @@ import com.e2eq.framework.model.auth.AuthProvider;
 import com.e2eq.framework.model.auth.AuthProviderFactory;
 import com.e2eq.framework.model.auth.UserManagement;
 import com.e2eq.framework.model.security.CredentialType;
+import com.e2eq.framework.rest.models.ChangeEmailRequest;
 import com.e2eq.framework.rest.models.ChangePasswordRequest;
 import com.e2eq.framework.rest.models.FileUpload;
 import com.e2eq.framework.rest.models.RestError;
@@ -105,6 +106,84 @@ public class CredentialsResource extends BaseResource<CredentialUserIdPassword, 
         }
 
         return Response.status(Response.Status.OK).entity("Password changed").build();
+    }
+
+    @Path("changeEmail")
+    @POST
+    @RolesAllowed({ "user", "admin", "system" })
+    @Produces(MediaType.APPLICATION_JSON)
+    @Consumes(MediaType.APPLICATION_JSON)
+    @Operation(summary = "Change a user's email")
+    public Response changeEmail(@Context SecurityContext securityContext,
+                                ChangeEmailRequest changeEmailRequest,
+                                @QueryParam("provider") @DefaultValue("") String provider) {
+
+        if (changeEmailRequest == null
+                || changeEmailRequest.getCurrentEmail() == null || changeEmailRequest.getCurrentEmail().isBlank()
+                || changeEmailRequest.getNewEmail() == null || changeEmailRequest.getNewEmail().isBlank()) {
+            RestError error = RestError.builder()
+                    .status(Response.Status.BAD_REQUEST.getStatusCode())
+                    .statusMessage("currentEmail and newEmail are required")
+                    .build();
+            return Response.status(Response.Status.BAD_REQUEST).entity(error).build();
+        }
+
+        if (changeEmailRequest.getCurrentEmail().equalsIgnoreCase(changeEmailRequest.getNewEmail())) {
+            RestError error = RestError.builder()
+                    .status(Response.Status.BAD_REQUEST.getStatusCode())
+                    .statusMessage("newEmail must differ from currentEmail")
+                    .build();
+            return Response.status(Response.Status.BAD_REQUEST).entity(error).build();
+        }
+
+        if (!securityContext.isUserInRole("admin") && !securityContext.isUserInRole("system") && securityContext.isUserInRole("user")) {
+            if (!securityContext.getUserPrincipal().getName().equals(changeEmailRequest.getCurrentEmail())) {
+                return Response.status(Response.Status.BAD_REQUEST).entity(RestError.builder()
+                        .status(Response.Status.BAD_REQUEST.getStatusCode())
+                        .statusMessage("Bad Request: User not authorized to change email, currentEmail was not the principal name")
+                        .reasonMessage("User not authorized to change email, currentEmail was not the principal name")
+                        .debugMessage("User not authorized to change email: PrincipalId:" + securityContext.getUserPrincipal().getName() + " passed currentEmail:" + changeEmailRequest.getCurrentEmail() + " not matching")
+                        .build()
+                ).build();
+            }
+        } else if (!securityContext.isUserInRole("admin") && !securityContext.isUserInRole("system") && !securityContext.isUserInRole("user")) {
+            throw new RuntimeException("Bad Request: User is neither an admin or a user aborting");
+        }
+
+        String requestedProvider = (provider == null || provider.isBlank())
+                ? changeEmailRequest.getAuthProvider()
+                : provider;
+
+        try {
+            UserManagement userManager = resolveUserManager(changeEmailRequest.getCurrentEmail(), requestedProvider);
+            userManager.changeEmail(changeEmailRequest.getCurrentEmail(), changeEmailRequest.getNewEmail());
+        } catch (UnsupportedOperationException e) {
+            RestError error = RestError.builder()
+                    .status(Response.Status.BAD_REQUEST.getStatusCode())
+                    .statusMessage("Changing email is not supported by the auth provider")
+                    .reasonMessage(e.getMessage())
+                    .build();
+            return Response.status(Response.Status.BAD_REQUEST).entity(error).build();
+        } catch (IllegalArgumentException e) {
+            RestError error = RestError.builder()
+                    .status(Response.Status.BAD_REQUEST.getStatusCode())
+                    .statusMessage("Invalid request")
+                    .reasonMessage(e.getMessage())
+                    .build();
+            return Response.status(Response.Status.BAD_REQUEST).entity(error).build();
+        } catch (Exception e) {
+            RestError error = RestError.builder()
+                    .status(Response.Status.INTERNAL_SERVER_ERROR.getStatusCode())
+                    .statusMessage("Failed to change email")
+                    .reasonMessage(e.getMessage())
+                    .build();
+            return Response.status(Response.Status.INTERNAL_SERVER_ERROR).entity(error).build();
+        }
+
+        SuccessResponse success = new SuccessResponse();
+        success.setStatusCode(Response.Status.OK.getStatusCode());
+        success.setMessage("Email changed successfully");
+        return Response.ok().entity(success).build();
     }
 
     @Path("resendTemporaryPassword")

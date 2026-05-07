@@ -139,6 +139,12 @@ public class CustomTokenAuthProvider extends BaseAuthProvider implements AuthPro
    }
 
    @Override
+   public void changeEmail(String userId, String newEmail) throws SecurityException {
+      throw new UnsupportedOperationException(
+         "Changing email is not supported by CustomTokenAuthProvider");
+   }
+
+   @Override
    public String createUser (String userId, String password,  Set<String> roles,
                            DomainContext domainContext) throws SecurityException {
       return createUser( userId, password, false, roles, domainContext);
