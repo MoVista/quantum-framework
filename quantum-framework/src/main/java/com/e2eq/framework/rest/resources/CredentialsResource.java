@@ -110,7 +110,7 @@ public class CredentialsResource extends BaseResource<CredentialUserIdPassword, 
 
     @Path("changeEmail")
     @POST
-    @RolesAllowed({ "user", "admin", "system" })
+    @RolesAllowed({ "admin", "system" })
     @Produces(MediaType.APPLICATION_JSON)
     @Consumes(MediaType.APPLICATION_JSON)
     @Operation(summary = "Change a user's email")
