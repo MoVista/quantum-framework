@@ -114,8 +114,7 @@ public class CredentialsResource extends BaseResource<CredentialUserIdPassword, 
     @Produces(MediaType.APPLICATION_JSON)
     @Consumes(MediaType.APPLICATION_JSON)
     @Operation(summary = "Change a user's email")
-    public Response changeEmail(@Context SecurityContext securityContext,
-                                ChangeEmailRequest changeEmailRequest,
+    public Response changeEmail(ChangeEmailRequest changeEmailRequest,
                                 @QueryParam("provider") @DefaultValue("") String provider) {
 
         if (changeEmailRequest == null
@@ -134,20 +133,6 @@ public class CredentialsResource extends BaseResource<CredentialUserIdPassword, 
                     .statusMessage("newEmail must differ from currentEmail")
                     .build();
             return Response.status(Response.Status.BAD_REQUEST).entity(error).build();
-        }
-
-        if (!securityContext.isUserInRole("admin") && !securityContext.isUserInRole("system") && securityContext.isUserInRole("user")) {
-            if (!securityContext.getUserPrincipal().getName().equals(changeEmailRequest.getCurrentEmail())) {
-                return Response.status(Response.Status.BAD_REQUEST).entity(RestError.builder()
-                        .status(Response.Status.BAD_REQUEST.getStatusCode())
-                        .statusMessage("Bad Request: User not authorized to change email, currentEmail was not the principal name")
-                        .reasonMessage("User not authorized to change email, currentEmail was not the principal name")
-                        .debugMessage("User not authorized to change email: PrincipalId:" + securityContext.getUserPrincipal().getName() + " passed currentEmail:" + changeEmailRequest.getCurrentEmail() + " not matching")
-                        .build()
-                ).build();
-            }
-        } else if (!securityContext.isUserInRole("admin") && !securityContext.isUserInRole("system") && !securityContext.isUserInRole("user")) {
-            throw new RuntimeException("Bad Request: User is neither an admin or a user aborting");
         }
 
         String requestedProvider = (provider == null || provider.isBlank())
