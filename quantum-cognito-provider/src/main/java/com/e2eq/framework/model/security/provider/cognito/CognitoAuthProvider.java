@@ -536,6 +536,50 @@ public class CognitoAuthProvider extends BaseAuthProvider implements AuthProvide
       credentialRepo.save(ocred.get());
    }
 
+   /**
+    * Updates the email attribute on a Cognito user and marks it as verified.
+    * Does not modify the local credential record; callers must keep the credential's
+    * userId in sync when appropriate.
+    *
+    * @param userId application user id used to resolve the Cognito username
+    * @param newEmail the replacement email address; must be a valid email
+    * @throws SecurityException if the user cannot be resolved or the Cognito call fails
+    */
+   @Override
+   public void changeEmail(String userId, String newEmail) throws SecurityException {
+      requireValidEmail(newEmail);
+
+      if (isCognitoDisabled()) {
+         Log.debug("Cognito disabled: skipping remote email update");
+         return;
+      }
+
+      Optional<CredentialUserIdPassword> ocred = credentialRepo.findByUserId(userId, envConfigUtils.getSystemRealm(), true);
+      String username = ocred.isPresent() ? ocred.get().getUserId() : userId;
+
+      try {
+         cognitoClient.adminUpdateUserAttributes(AdminUpdateUserAttributesRequest.builder()
+            .userPoolId(userPoolId)
+            .username(username)
+            .userAttributes(
+               AttributeType.builder().name("email").value(newEmail).build(),
+               AttributeType.builder().name("email_verified").value("true").build()
+            )
+            .build());
+         Log.infof("Updated email attribute for userId:%s to:%s", userId, newEmail);
+      } catch (UserNotFoundException e) {
+         Log.warnf("User not found in Cognito for userId:%s: %s", userId, e.getMessage());
+         throw new SecurityException(String.format("User not found in Cognito for userId:%s", userId), e);
+      } catch (CognitoIdentityProviderException e) {
+         Log.errorf(e, "Failed to change email for userId:%s", userId);
+         throw new SecurityException(String.format("Failed to change email for userId:%s : %s",
+            userId, e.awsErrorDetails().errorMessage()), e);
+      } catch (Exception e) {
+         Log.errorf(e, "Unexpected error changing email for userId:%s", userId);
+         throw new SecurityException(String.format("Failed to change email for userId:%s : %s", userId, e.getMessage()), e);
+      }
+   }
+
    @Override
    public String createUser ( String userId, String password,  Set<String> roles, DomainContext domainContext) throws SecurityException {
       return createUser( userId, password, null,  roles, domainContext);
