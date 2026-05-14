@@ -41,6 +41,9 @@ import java.util.*;
 @ApplicationScoped
 public class MorphiaSeedRepository implements SeedRepository {
 
+    @SuppressWarnings("rawtypes")
+    private volatile List<BaseMorphiaRepo> cachedRepos;
+
     @Inject
     ObjectMapper objectMapper;
 
@@ -757,16 +760,19 @@ public class MorphiaSeedRepository implements SeedRepository {
 
    @SuppressWarnings({"unchecked", "rawtypes"})
    private Optional<BaseMorphiaRepo<? extends UnversionedBaseModel>> resolveRepo(SeedPackManifest.Dataset dataset) {
-      // Discover all BaseMorphiaRepo beans via BeanManager (ArC's listAll/select doesn't
-      // resolve parameterized interface types like BaseMorphiaRepo<T> against the raw type).
-      ArcContainer container = Arc.container();
-      List<BaseMorphiaRepo> repos = container.beanManager()
-            .getBeans(Object.class, Any.Literal.INSTANCE).stream()
-            .filter(b -> BaseMorphiaRepo.class.isAssignableFrom(b.getBeanClass()))
-            .map(b -> (BaseMorphiaRepo) container.select(b.getBeanClass(), Any.Literal.INSTANCE).get())
-            .toList();
-      Log.debugf("resolveRepo: %d BaseMorphiaRepo bean(s) discovered for %s",
-            repos.size(), dataset.getCollection());
+      List<BaseMorphiaRepo> repos = cachedRepos;
+      if (repos == null) {
+         // ArC's listAll/select doesn't resolve parameterized interface types like
+         // BaseMorphiaRepo<T> against the raw type, so discover via BeanManager instead.
+         ArcContainer container = Arc.container();
+         repos = container.beanManager()
+               .getBeans(Object.class, Any.Literal.INSTANCE).stream()
+               .filter(b -> BaseMorphiaRepo.class.isAssignableFrom(b.getBeanClass()))
+               .map(b -> (BaseMorphiaRepo) container.select(b.getBeanClass(), Any.Literal.INSTANCE).get())
+               .toList();
+         cachedRepos = repos;
+         Log.debugf("resolveRepo: discovered and cached %d BaseMorphiaRepo bean(s)", repos.size());
+      }
 
       // 0) If repoClass is explicitly provided
       String repoClassName = null;
@@ -811,9 +817,9 @@ public class MorphiaSeedRepository implements SeedRepository {
                if (modelClassName.equals(pc.getName()) || modelClassName.equals(pc.getSimpleName())) {
                   return Optional.of((BaseMorphiaRepo<? extends UnversionedBaseModel>) repo);
                }
-            } catch (Throwable t) {
+            } catch (Exception e) {
                Log.debugf("resolveRepo: skipping repo %s due to getPersistentClass() error: %s",
-                     getRealClass(repo).getSimpleName(), t.getMessage());
+                     getRealClass(repo).getSimpleName(), e.getMessage());
             }
          }
          throw new IllegalStateException("No Morphia repository bean found for model class: " + modelClassName);
