@@ -681,11 +681,11 @@ public class CSVExportHelper {
             }
             StringBuilder joined = new StringBuilder();
             for (int i = 0; i < length; i++) {
-                if (i > 0) {
-                    joined.append(JOINER);
-                }
                 Object element = java.lang.reflect.Array.get(array, i);
                 if (element != null) {
+                    if (joined.length() > 0) {
+                        joined.append(JOINER);
+                    }
                     joined.append(element);
                 }
             }
@@ -788,10 +788,10 @@ public class CSVExportHelper {
      * Resolves the dynamic suffix after an additionalFields map has been read by Dozer.
      */
     public class MapPathCellProcessor extends CellProcessorAdaptor {
-        private final String suffixPath;
+        private final String[] pathSegments;
 
         public MapPathCellProcessor(String suffixPath) {
-            this.suffixPath = suffixPath;
+            this.pathSegments = suffixPath.split("\\.");
         }
 
         @Override
@@ -801,7 +801,7 @@ public class CSVExportHelper {
                 return next.execute("", context);
             }
 
-            for (String segment : suffixPath.split("\\.")) {
+            for (String segment : pathSegments) {
                 if (current == null || StringUtils.isBlank(segment)) {
                     return next.execute("", context);
                 }
