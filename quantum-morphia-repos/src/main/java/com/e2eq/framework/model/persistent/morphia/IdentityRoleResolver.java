@@ -2,6 +2,7 @@ package com.e2eq.framework.model.persistent.morphia;
 
 import com.e2eq.framework.model.auth.RoleAssignment;
 import com.e2eq.framework.model.auth.RoleSource;
+import com.e2eq.framework.model.security.CredentialType;
 import com.e2eq.framework.model.security.CredentialUserIdPassword;
 import com.e2eq.framework.model.security.UserGroup;
 import com.e2eq.framework.model.security.UserProfile;
@@ -95,7 +96,8 @@ public class IdentityRoleResolver {
 
         // USERGROUP roles via UserProfile -> UserGroup definitions
         try {
-            if (credential != null) {
+            // Don't attempt user profile lookups for service tokens
+            if (credential != null && credential.getCredentialType() != CredentialType.SERVICE_TOKEN) {
                 // Use the provided realm for UserProfile/UserGroup lookups
                 // This ensures we query the correct tenant's datastore, not just system-com
                 Log.debugf("IdentityRoleResolver: looking up UserProfile for subject=%s in realm=%s",
