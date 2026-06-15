@@ -767,9 +767,10 @@ public class TestCSVFeatures extends BaseRepoTest {
         streamingOutput.write(output);
         String csvOutput = output.toString(Charset.forName("UTF-8"));
 
-        assertTrue(csvOutput.contains("alpha, beta, gamma"), "Should join String[] tags for CSV export");
+        assertTrue(
+                csvOutput.contains("project-with-tags,\"alpha, beta, gamma\",creator@example.com"),
+                "Should export refName, joined quoted tags, and nested creator in one row");
         assertFalse(csvOutput.contains("[Ljava.lang.String"), "Should not export Java array toString");
-        assertTrue(csvOutput.contains("creator@example.com"), "Should export nested auditInfo.creationIdentity");
     }
 
     @Test
