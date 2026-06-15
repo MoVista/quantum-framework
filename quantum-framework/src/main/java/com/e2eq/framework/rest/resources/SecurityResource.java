@@ -1,6 +1,7 @@
 package com.e2eq.framework.rest.resources;
 
 
+import com.e2eq.framework.annotations.FunctionalMapping;
 import com.e2eq.framework.model.persistent.morphia.RealmRepo;
 import com.e2eq.framework.model.auth.AuthProvider;
 import com.e2eq.framework.model.auth.AuthProviderFactory;
@@ -206,6 +207,7 @@ public class SecurityResource {
 
 
     @Path("me")
+    @FunctionalMapping(area = "security", domain = "userProfile")
     @Authenticated
     @GET
     @Produces(MediaType.APPLICATION_JSON)
