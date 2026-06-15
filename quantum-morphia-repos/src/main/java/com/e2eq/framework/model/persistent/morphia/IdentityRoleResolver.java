@@ -224,6 +224,14 @@ public class IdentityRoleResolver {
                         out.computeIfAbsent(r, k -> EnumSet.noneOf(RoleSource.class)).add(RoleSource.CREDENTIAL);
                     }
                 }
+
+                if (cred.getCredentialType() == CredentialType.SERVICE_TOKEN) {
+                    // SERVICE_TOKEN credentials do not have their own UserProfile/UserGroup memberships.
+                    // Return roles assigned directly to the credential.
+                    Log.debugf("resolveRoleSources: returning service token roles=%s", out.keySet());
+                    return out;
+                }
+
                 // User group roles via profile (always unioned when credential exists)
                 try {
                     // Use the provided realm to ensure we read the profile from the correct tenant datastore
