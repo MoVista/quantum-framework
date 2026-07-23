@@ -75,11 +75,13 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
     protected boolean autoMaterialize;
 
     // Opt-in MongoDB collation applied to server-side list/aggregation sorts.
-    // Empty locale disables collation and preserves upstream binary-order behavior.
+    // Absent/blank locale disables collation and preserves upstream binary-order behavior.
+    // Optional<String> (not defaultValue="") because Quarkus/SmallRye treats an empty
+    // defaultValue as "no default" and then fails boot when the property is unset.
     // Downstreams (e.g. Movista, MOV-12188) set locale=en, strength=2 (SECONDARY)
     // to get case-insensitive text sorting for AG Grid list grids.
-    @ConfigProperty(name = "quantum.sort.collation.locale", defaultValue = "")
-    protected String sortCollationLocale;
+    @ConfigProperty(name = "quantum.sort.collation.locale")
+    protected Optional<String> sortCollationLocale = Optional.empty();
 
     @ConfigProperty(name = "quantum.sort.collation.strength", defaultValue = "2")
     protected int sortCollationStrength;
@@ -488,8 +490,8 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
     /**
      * Default {@link BaseMorphiaRepo#getSortCollation()} implementation
      * that reads {@code quantum.sort.collation.locale} and
-     * {@code quantum.sort.collation.strength} config properties; a blank
-     * locale disables collation (upstream default). An out-of-range strength
+     * {@code quantum.sort.collation.strength} config properties; an absent or
+     * blank locale disables collation (upstream default). An out-of-range strength
      * value is logged at WARN and treated as disabled rather than throwing.
      *
      * <p>Subclasses may override to supply a fixed policy independent of
@@ -511,18 +513,19 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
     }
 
     private Collation buildSortCollation() {
-        if (sortCollationLocale == null || sortCollationLocale.isBlank()) {
+        String locale = sortCollationLocale == null ? "" : sortCollationLocale.orElse("");
+        if (locale.isBlank()) {
             return null;
         }
         try {
             return Collation.builder()
-                    .locale(sortCollationLocale)
+                    .locale(locale)
                     .collationStrength(CollationStrength.fromInt(sortCollationStrength))
                     .build();
         } catch (IllegalArgumentException ex) {
             Log.warnf(
                     "Invalid quantum.sort.collation.strength=%d for locale=%s; disabling sort collation. Valid range is 1-5 (PRIMARY..IDENTICAL).",
-                    sortCollationStrength, sortCollationLocale);
+                    sortCollationStrength, locale);
             return null;
         }
     }
