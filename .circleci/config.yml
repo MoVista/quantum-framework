@@ -1,0 +1,59 @@
+# Use the latest 2.1 version of CircleCI pipeline process engine.
+# See: https://circleci.com/docs/configuration-reference
+version: 2.1
+
+jobs:
+  build-and-test:
+    docker:
+      - image: cimg/openjdk:23.0
+      - image: mongo:7
+        command: ["mongod", "--replSet", "rs0", "--bind_ip_all"]
+
+    steps:
+      - checkout
+
+      - restore_cache:
+          keys:
+            # Try to restore the cache based on a hash of the dependencies in the pom.xml
+            # Change the v1 if we need to bust the cache
+            - maven-repo-v1-{{ checksum "pom.xml" }}
+            # Fallback to the last cache key
+            - maven-repo-v1-
+
+      - run:
+          name: Wait for MongoDB and initialize replica set
+          command: |
+            dockerize -wait tcp://localhost:27017 -timeout 60s
+            curl -fsSL https://downloads.mongodb.com/compass/mongosh-2.3.8-linux-x64.tgz \
+              | sudo tar -xz -C /usr/local --strip-components=1
+            mongosh --eval 'rs.initiate({_id:"rs0", members:[{_id:0, host:"localhost:27017"}]})'
+
+      - run:
+          name: Build and test
+          command: >
+            mvn -B clean install
+            -pl '!quantum-docs,!quantum-cognito-provider'
+
+      - run:
+          name: Delete snapshot artifacts
+          command: find ~/.m2/repository -type d -name "*-SNAPSHOT" -exec rm -rf {} +
+
+      - save_cache:
+          paths:
+            - ~/.m2/repository
+          when: on_success
+          key: maven-repo-v1-{{ checksum "pom.xml" }}
+
+      - run:
+          name: Collect test results
+          when: always
+          command: |
+            mkdir -p ~/test-results
+            find . -type f -path "*/target/surefire-reports/*.xml" -exec cp {} ~/test-results/ \;
+      - store_test_results:
+          path: ~/test-results
+
+workflows:
+  build:
+    jobs:
+      - build-and-test
