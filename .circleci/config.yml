@@ -49,7 +49,12 @@ jobs:
           when: always
           command: |
             mkdir -p ~/test-results
-            find . -type f -path "*/target/surefire-reports/*.xml" -exec cp {} ~/test-results/ \;
+            find . -type f -path "*/target/surefire-reports/*.xml" \
+              | while read -r f; do
+                  dest=~/test-results/$(dirname "$f")
+                  mkdir -p "$dest"
+                  cp "$f" "$dest/"
+                done
       - store_test_results:
           path: ~/test-results
 
