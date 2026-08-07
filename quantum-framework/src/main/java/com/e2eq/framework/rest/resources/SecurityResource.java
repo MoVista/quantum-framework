@@ -217,6 +217,16 @@ public class SecurityResource {
             Log.info("me: - UserId:" + securityContext.getUserPrincipal().getName());
 
         try {
+            // When X-Impersonate-* is active, SecurityFilter has already swapped PrincipalContext
+            // to the target. /me must return that identity — not the JWT/SecurityIdentity principal —
+            // so portal permission evaluation (getPermissions → evaluate) matches API enforcement.
+            Optional<com.e2eq.framework.model.securityrules.PrincipalContext> impersonatedPc =
+                    com.e2eq.framework.model.securityrules.SecurityContext.getPrincipalContext()
+                            .filter(pc -> pc.getImpersonatedByUserId() != null || pc.getImpersonatedBySubject() != null);
+            if (impersonatedPc.isPresent()) {
+                return meForImpersonatedPrincipal(impersonatedPc.get());
+            }
+
             String principalName = securityIdentity.getPrincipal().getName();
             String systemRealm = envConfigUtils.getSystemRealm();
             Optional<CredentialUserIdPassword> credentialOp = findCredential(principalName, null);
@@ -455,6 +465,59 @@ public class SecurityResource {
                 issuer,
                 credential);
 
+        return Response.ok(response).build();
+    }
+
+    private Response meForImpersonatedPrincipal(
+            com.e2eq.framework.model.securityrules.PrincipalContext pc) {
+        String targetUserId = pc.getUserId();
+        if (targetUserId == null || targetUserId.isBlank()) {
+            RestError error = RestError.builder()
+                    .statusMessage("Impersonation is active but PrincipalContext has no userId")
+                    .status(Response.Status.INTERNAL_SERVER_ERROR.getStatusCode())
+                    .build();
+            return Response.status(Response.Status.INTERNAL_SERVER_ERROR).entity(error).build();
+        }
+
+        Optional<CredentialUserIdPassword> credentialOp = findCredential(null, targetUserId);
+        if (credentialOp.isEmpty()) {
+            RestError error = RestError.builder()
+                    .statusMessage("Could not find credential for impersonated userId:" + targetUserId)
+                    .status(Response.Status.NOT_FOUND.getStatusCode())
+                    .build();
+            return Response.status(Response.Status.NOT_FOUND).entity(error).build();
+        }
+
+        CredentialUserIdPassword cred = credentialOp.get();
+        String systemRealm = envConfigUtils.getSystemRealm();
+        String targetRealm = pc.getDefaultRealm() != null && !pc.getDefaultRealm().isBlank()
+                ? pc.getDefaultRealm()
+                : (cred.getDomainContext() != null ? cred.getDomainContext().getDefaultRealm() : null);
+
+        Optional<UserProfile> userProfileOp = Optional.empty();
+        if (targetRealm != null && !targetRealm.isBlank()) {
+            userProfileOp = userProfileRepo.getByUserIdWithIgnoreRules(targetRealm, targetUserId);
+            if (userProfileOp.isEmpty() && cred.getSubject() != null) {
+                userProfileOp = userProfileRepo.getBySubject(targetRealm, cred.getSubject());
+            }
+        }
+        if (userProfileOp.isEmpty()) {
+            userProfileOp = userProfileRepo.getByUserIdWithIgnoreRules(systemRealm, targetUserId);
+        }
+
+        Object principal = cred;
+        if (userProfileOp.isPresent()) {
+            userProfileRepo.fillUIActions(userProfileOp.get());
+            principal = userProfileOp.get();
+        }
+
+        Map<String, Object> response = withAccessibleRealms(principal, cred, cred.getSubject());
+        // Effective roles (credential + groups) from the impersonated PrincipalContext — not
+        // credential.roles alone, and not the operator JWT.
+        if (pc.getRoles() != null) {
+            response.put("roles", Arrays.asList(pc.getRoles()));
+        }
+        response.put("userId", targetUserId);
         return Response.ok(response).build();
     }
 

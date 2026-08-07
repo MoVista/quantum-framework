@@ -998,9 +998,11 @@ public class SecurityFilter implements ContainerRequestFilter, jakarta.ws.rs.con
 
     private PrincipalContext buildImpersonatedContext(CredentialUserIdPassword targetCreds, CredentialUserIdPassword originalCreds,
                                                      String actingOnBehalfOfSubject, String actingOnBehalfOfUserId) {
-        // Use the target credential's realm for UserProfile/UserGroup lookups during impersonation
+        // Use the target credential's realm for UserProfile/UserGroup lookups during impersonation.
+        // Pass null SecurityIdentity so the operator's JWT/TOKEN roles are not unioned into the
+        // target principal (IdentityRoleResolver always adds TOKEN roles when identity is present).
         String targetRealm = targetCreds.getDomainContext().getDefaultRealm();
-        String[] roles = resolveEffectiveRoles(securityIdentity, targetCreds, targetRealm);
+        String[] roles = resolveEffectiveRoles(null, targetCreds, targetRealm);
         DataDomain dataDomain = targetCreds.getDomainContext().toDataDomain(targetCreds.getUserId());
 
         return new PrincipalContext.Builder()
