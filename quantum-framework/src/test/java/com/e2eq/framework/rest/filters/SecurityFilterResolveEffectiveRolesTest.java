@@ -2,16 +2,18 @@ package com.e2eq.framework.rest.filters;
 
 import com.e2eq.framework.model.persistent.base.EntityReference;
 import com.e2eq.framework.model.security.CredentialUserIdPassword;
+import com.e2eq.framework.model.security.DomainContext;
 import com.e2eq.framework.model.security.UserGroup;
 import com.e2eq.framework.model.security.UserProfile;
 import com.e2eq.framework.model.persistent.morphia.UserGroupRepo;
 import com.e2eq.framework.model.persistent.morphia.UserProfileRepo;
-import com.e2eq.framework.rest.models.Role;
+import com.e2eq.framework.model.securityrules.PrincipalContext;
 import io.quarkus.security.identity.SecurityIdentity;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.security.Principal;
 import java.util.*;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -25,13 +27,17 @@ import static org.junit.jupiter.api.Assertions.*;
  */
 public class SecurityFilterResolveEffectiveRolesTest {
 
-    private static SecurityIdentity identityWithRoles(Set<String> roles) {
+    private static SecurityIdentity identityWithRoles(String principalName, Set<String> roles) {
+        Principal principal = principalName == null ? null : () -> principalName;
         return (SecurityIdentity) java.lang.reflect.Proxy.newProxyInstance(
                 SecurityIdentity.class.getClassLoader(),
                 new Class[]{SecurityIdentity.class},
                 (proxy, method, args) -> {
                     if ("getRoles".equals(method.getName())) {
                         return roles;
+                    }
+                    if ("getPrincipal".equals(method.getName())) {
+                        return principal;
                     }
                     Class<?> rt = method.getReturnType();
                     if (rt.equals(boolean.class)) return false;
@@ -47,6 +53,10 @@ public class SecurityFilterResolveEffectiveRolesTest {
                     return null;
                 }
         );
+    }
+
+    private static SecurityIdentity identityWithRoles(Set<String> roles) {
+        return identityWithRoles(null, roles);
     }
 
     // Simple stubs for repos
@@ -147,5 +157,75 @@ public class SecurityFilterResolveEffectiveRolesTest {
 
         String[] effective = invokeResolveEffectiveRoles(filter, identity, null);
         assertArrayEquals(new String[]{"ANONYMOUS"}, effective);
+    }
+
+    /**
+     * Regression for impersonation: buildImpersonatedContext must call
+     * resolveEffectiveRoles(null, targetCreds, ...) so operator TOKEN/JWT roles are not
+     * unioned into the impersonated PrincipalContext.
+     */
+    @Test
+    public void testBuildImpersonatedContextExcludesOperatorTokenRoles() throws Exception {
+        DomainContext domainContext = DomainContext.builder()
+                .tenantId("t1")
+                .defaultRealm("realmA")
+                .orgRefName("org1")
+                .accountId("acct1")
+                .build();
+
+        CredentialUserIdPassword targetCreds = CredentialUserIdPassword.builder()
+                .userId("target@example.com")
+                .subject("target-subject")
+                .domainContext(domainContext)
+                .lastUpdate(new Date())
+                .roles(new String[]{"user", "viewer"})
+                .build();
+
+        CredentialUserIdPassword operatorCreds = CredentialUserIdPassword.builder()
+                .userId("admin@example.com")
+                .subject("admin-subject")
+                .domainContext(domainContext)
+                .lastUpdate(new Date())
+                .roles(new String[]{"admin"})
+                .build();
+
+        SecurityIdentity operatorIdentity = identityWithRoles(
+                "admin-subject",
+                new HashSet<>(Arrays.asList("admin", "superuser")));
+
+        StubUserProfileRepo upr = new StubUserProfileRepo();
+        StubUserGroupRepo ugr = new StubUserGroupRepo();
+        SecurityFilter filter = newFilterWithRepos(upr, ugr);
+        // Keep identityRoleResolver null so the unit-test fallback path is used (no CDI).
+
+        // Control: passing the operator identity unions TOKEN roles into the result.
+        String[] withOperatorIdentity = invokeResolveEffectiveRoles(filter, operatorIdentity, targetCreds);
+        Set<String> leaked = new HashSet<>(Arrays.asList(withOperatorIdentity));
+        assertTrue(leaked.contains("admin") || leaked.contains("superuser"),
+                "control case should include operator TOKEN roles when identity is present: " + leaked);
+
+        Method build = SecurityFilter.class.getDeclaredMethod(
+                "buildImpersonatedContext",
+                CredentialUserIdPassword.class,
+                CredentialUserIdPassword.class,
+                String.class,
+                String.class);
+        build.setAccessible(true);
+        PrincipalContext impersonated = (PrincipalContext) build.invoke(
+                filter, targetCreds, operatorCreds, null, null);
+
+        assertEquals("target@example.com", impersonated.getUserId());
+        assertEquals("admin@example.com", impersonated.getImpersonatedByUserId());
+        assertEquals("admin-subject", impersonated.getImpersonatedBySubject());
+
+        Set<String> impersonatedRoles = new HashSet<>(Arrays.asList(impersonated.getRoles()));
+        assertTrue(impersonatedRoles.contains("user"),
+                "target credential roles should be present: " + impersonatedRoles);
+        assertTrue(impersonatedRoles.contains("viewer"),
+                "target credential roles should be present: " + impersonatedRoles);
+        assertFalse(impersonatedRoles.contains("admin"),
+                "operator TOKEN role 'admin' must not leak into impersonated context: " + impersonatedRoles);
+        assertFalse(impersonatedRoles.contains("superuser"),
+                "operator TOKEN role 'superuser' must not leak into impersonated context: " + impersonatedRoles);
     }
 }

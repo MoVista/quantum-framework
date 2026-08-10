@@ -422,6 +422,17 @@ public class SecurityFilter implements ContainerRequestFilter, jakarta.ws.rs.con
 
         Log.debugf("Running impersonation filter script for user:%s, userId:%s, realm:%s", subject, userId, realm);
 
+        // Fast-path for constant allow/deny filters (common enableImpersonation("true") case).
+        // Avoids spinning up a Graal context — with python-community on the classpath, engine
+        // init alone can exceed the scripting memory budget and falsely deny impersonation.
+        String trimmedScript = script.trim();
+        if ("true".equalsIgnoreCase(trimmedScript)) {
+            return true;
+        }
+        if ("false".equalsIgnoreCase(trimmedScript)) {
+            return false;
+        }
+
         // Resolve scripting config with runtime fallback (when not CDI-injected)
         boolean enabled = scriptingEnabled;
         boolean allowAll = scriptingAllowAllAccess;
