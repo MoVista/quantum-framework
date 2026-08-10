@@ -84,19 +84,36 @@ public abstract class HierarchicalRepo<
 
     @Override
     public T save(@Valid T value) {
+        return saveInRealm(getSecurityContextRealmId(), value);
+    }
+
+    @Override
+    public T save(@NotNull String realmId, @Valid T value) {
+        return saveInRealm(realmId, value);
+    }
+
+    /**
+     * Shared hierarchy-aware save that binds all reads and writes to the given realm.
+     * Used by both ambient and explicit-realm save entry points so X-Realm POST paths
+     * preserve parent/descendant invariants.
+     */
+    protected T saveInRealm(@NotNull String realmId, @Valid T value) {
+        Objects.requireNonNull(realmId, "realmId must not be null");
         T saved;
-        // create a transactional session
-        try (MorphiaSession session = morphiaDataStoreWrapper.getDataStore(getSecurityContextRealmId()).startSession()) {
+        // create a transactional session bound to the selected realm
+        try (MorphiaSession session = morphiaDataStoreWrapper.getDataStore(realmId).startSession()) {
             // if updating, and parent changed, remove from old parent's descendants
             if (value.getId() != null) {
-                T existing = this.findById(value.getId()).orElse(null);
+                T existing = this.findById(session, value.getId()).orElse(null);
                 if (existing != null && existing.getParent() != null) {
                     ObjectId oldParentId = existing.getParent().getEntityId();
                     ObjectId newParentId = (value.getParent() != null) ? value.getParent().getEntityId() : null;
                     if (!Objects.equals(oldParentId, newParentId)) {
-                        Optional<T> oOldParent = this.findById(oldParentId);
+                        Optional<T> oOldParent = this.findById(session, oldParentId);
                         if (oOldParent.isPresent()) {
-                            oOldParent.get().getDescendants().remove(existing.getId());
+                            if (oOldParent.get().getDescendants() != null) {
+                                oOldParent.get().getDescendants().remove(existing.getId());
+                            }
                             super.save(session, oOldParent.get());
                         }
                     }
@@ -110,8 +127,8 @@ public abstract class HierarchicalRepo<
                     throw new NotFoundException("Parent id is null");
                 }
 
-                // Parent must exist
-                this.findById(newParentId)
+                // Parent must exist in the same realm/session
+                this.findById(session, newParentId)
                         .orElseThrow(() -> new NotFoundException("Parent node not found for id: " + newParentId));
 
                 // Self-parenting check
@@ -128,7 +145,7 @@ public abstract class HierarchicalRepo<
                                     "Invalid hierarchy: setting parent to a descendant would create a cycle (node="
                                             + value.getId() + ", parent=" + newParentId + ")");
                         }
-                        Optional<T> p = findById(cursor);
+                        Optional<T> p = findById(session, cursor);
                         if (!p.isPresent() || p.get().getParent() == null) {
                             break; // reached root
                         }
@@ -142,7 +159,7 @@ public abstract class HierarchicalRepo<
 
             // Ensure parent's descendants include this node
             if (saved.getParent() != null) {
-                Optional<T> oParent = findById(saved.getParent().getEntityId());
+                Optional<T> oParent = findById(session, saved.getParent().getEntityId());
                 if (!oParent.isPresent()) {
                     throw new NotFoundException("Parent node not found for id: " + saved.getParent().getEntityId());
                 }

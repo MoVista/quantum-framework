@@ -9,6 +9,7 @@ import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Field;
 import java.util.List;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -41,7 +42,7 @@ class MorphiaRepoSortCollationTest {
      */
     static class TestRepo extends MorphiaRepo<SortCollationTestModel> {
         TestRepo(String locale, int strength) {
-            this.sortCollationLocale = locale;
+            this.sortCollationLocale = Optional.ofNullable(locale);
             this.sortCollationStrength = strength;
         }
 
