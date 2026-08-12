@@ -58,6 +58,15 @@ import software.amazon.awssdk.services.cognitoidentityprovider.model.*;
 @ApplicationScoped
 public class CognitoAuthProvider extends BaseAuthProvider implements AuthProvider, UserManagement, ClaimsAuthProvider {
 
+      /**
+       * Credential roles that mean the Cognito user has portal access. Used to stamp
+       * {@code custom:portalAccess} for Cognito custom-email template selection.
+       */
+      private static final Set<String> PORTAL_ACCESS_ROLES =
+         Collections.unmodifiableSet(new HashSet<>(Arrays.asList("admin", "system", "portal-associate")));
+
+      private static final String PORTAL_ACCESS_ATTR = "custom:portalAccess";
+
       @ConfigProperty(name = "auth.jwt.secret")
       String secretKey;
 
@@ -673,12 +682,15 @@ public class CognitoAuthProvider extends BaseAuthProvider implements AuthProvide
      } else {
         // 1.1) If no existing Cognito user, create a new user
         // Build AdminCreateUser request conditionally based on whether a temp password was provided
+        boolean portalAccess = rolesGrantPortalAccess(roles);
         AdminCreateUserRequest.Builder createBuilder = AdminCreateUserRequest.builder()
             .userPoolId(userPoolId)
             .username(userId)
             .userAttributes(
                 AttributeType.builder().name("email").value(userId).build(),
-                AttributeType.builder().name("email_verified").value("true").build()
+                AttributeType.builder().name("email_verified").value("true").build(),
+                // Must be on AdminCreateUser so CustomEmailSender sees it for the invite email.
+                portalAccessAttribute(portalAccess)
             );
 
         // If a temp password is provided, pass it through; otherwise let Cognito generate one and send the invite email
@@ -1133,6 +1145,39 @@ public class CognitoAuthProvider extends BaseAuthProvider implements AuthProvide
         }
     }
 
+    static boolean rolesGrantPortalAccess(Set<String> roles) {
+        if (roles == null || roles.isEmpty()) {
+            return false;
+        }
+        for (String portalRole : PORTAL_ACCESS_ROLES) {
+            if (roles.contains(portalRole)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static AttributeType portalAccessAttribute(boolean portalAccess) {
+        return AttributeType.builder()
+            .name(PORTAL_ACCESS_ATTR)
+            .value(portalAccess ? "true" : "false")
+            .build();
+    }
+
+    private void setPortalAccessAttribute(String userId, boolean portalAccess) {
+        try {
+            cognitoClient.adminUpdateUserAttributes(AdminUpdateUserAttributesRequest.builder()
+                .userPoolId(userPoolId)
+                .username(userId)
+                .userAttributes(portalAccessAttribute(portalAccess))
+                .build());
+            Log.debugf("Set %s=%s for userId:%s", PORTAL_ACCESS_ATTR, portalAccess, userId);
+        } catch (Exception e) {
+            // Do not fail role assignment if the pool schema has not been deployed yet.
+            Log.warnf("Failed to set %s for userId:%s: %s", PORTAL_ACCESS_ATTR, userId, e.getMessage());
+        }
+    }
+
     // Helper: fetch the Cognito 'sub' attribute via AdminGetUser
     private String fetchSubViaAdminGetUser(String userId) {
         try {
@@ -1204,6 +1249,12 @@ public class CognitoAuthProvider extends BaseAuthProvider implements AuthProvide
            }
             // Normalize target roles (null-safe)
             Set<String> targetRoles = (roles == null) ? Collections.emptySet() : new HashSet<>(roles);
+
+            // Portal-access promotion (and any grant of portal roles) flips the email-routing stamp.
+            // Do this even when Cognito groups already match, so a missing attribute can be repaired.
+            if (rolesGrantPortalAccess(targetRoles)) {
+               setPortalAccessAttribute(userId, true);
+            }
 
             // Fetch only Cognito groups for reconciliation (exclude local credential roles)
             Set<String> currentCognitoGroups = getCognitoGroupsForUserIdOnly(userId);
