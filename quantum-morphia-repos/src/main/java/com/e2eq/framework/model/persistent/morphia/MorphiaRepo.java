@@ -1298,6 +1298,15 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
     }
 
     /**
+     * Fields that every pair-based update path rejects outright, regardless of value: they are
+     * either identity/concurrency metadata ({@code refName}, {@code id}, {@code version}),
+     * maintained by the framework itself ({@code auditInfo}, {@code persistentEvents}), or a
+     * managed relationship ({@code references}) that must go through {@code save()}.
+     */
+    private static final List<String> RESERVED_UPDATE_FIELDS =
+            List.of("refName", "id", "version", "references", "auditInfo", "persistentEvents");
+
+    /**
      * The constraint annotations that mark a field as required. Only the
      * {@code jakarta.validation.constraints} variants are listed: they are retained at runtime and
      * are therefore visible to reflection, whereas the {@code org.jetbrains.annotations}
@@ -1319,9 +1328,10 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
     }
 
     /**
-     * Applies the validation rules that are common to every pair-based update path: managed
-     * references and ontology properties cannot be updated this way, a required field cannot be
-     * cleared, and a value for an enum field must name one of that enum's constants.
+     * Applies the validation rules that are common to every pair-based update path: reserved
+     * fields, managed references, and ontology properties cannot be updated this way; a required
+     * field cannot be cleared; a value for an enum field must name one of that enum's constants;
+     * and a non-null value must be assignable to the field's declared type.
      *
      * <p>A {@code null} value is a request to clear the field and is valid for any field that is
      * not required, including an enum field.
@@ -1329,10 +1339,14 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
      * @param field the reflected field being updated
      * @param pair  the field/value pair supplied by the caller
      * @throws NotSupportedException    if the field is a managed reference or an ontology property
-     * @throws IllegalArgumentException if the value is null for a required field, or is not a valid
-     *                                  constant of an enum field
+     * @throws IllegalArgumentException if the pair targets a reserved field, the value is null for
+     *                                  a required field, is not a valid constant of an enum field,
+     *                                  or is not assignable to the field's declared type
      */
     private void validateUpdatableField(@NotNull Field field, @NotNull Pair<String, Object> pair) {
+        if (RESERVED_UPDATE_FIELDS.contains(pair.getKey())) {
+            throw new IllegalArgumentException("Field:" + pair.getKey() + " is a reserved field and can't be updated");
+        }
         if (field.getAnnotation(Reference.class) != null) {
             Log.warn("Update to class that contains references");
             throw new NotSupportedException("Field:" + field + " is a managed reference, and not updatable via put. Use Post");
@@ -1352,6 +1366,15 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
             if (Arrays.stream(field.getType().getEnumConstants()).noneMatch(e -> e.toString().equals(value))) {
                 throw new IllegalArgumentException("Invalid value for enum field " + pair.getKey() + " can't set value:" + pair.getValue());
             }
+        }
+        // Checked in addition to, not instead of, the enum-constant check above: a value whose
+        // toString() happens to match a constant's name (e.g. the String "HIGH") must still be
+        // rejected as the wrong type rather than accepted because the name matched.
+        if (!field.getType().isAssignableFrom(pair.getValue().getClass())) {
+            throw new IllegalArgumentException("Invalid value for field " + pair.getKey() +
+                    " can't set value:" + pair.getValue() +
+                    " expected type: " + field.getType() +
+                    " but got: " + pair.getValue().getClass().getSimpleName());
         }
     }
 
@@ -1409,7 +1432,6 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
     @SafeVarargs
     public final long update(Datastore datastore, @NotNull ObjectId id, @NotNull Pair<String, Object>... pairs) throws InvalidStateTransitionException {
        List<UpdateOperator> updateOperators = new ArrayList<>();
-       List<String> reservedFields = List.of("refName", "id", "version", "references", "auditInfo", "persistentEvents");
 
        // Fetch the current entity to validate state transitions
        Optional<T> currentEntityOpt = findById(datastore, id);
@@ -1419,10 +1441,6 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
        T currentEntity = currentEntityOpt.get();
 
        for (Pair<String, Object> pair : pairs) {
-          if (reservedFields.contains(pair.getKey())) {
-             throw new IllegalArgumentException("Field:" + pair.getKey() + " is a reserved field and can't be updated");
-          }
-
           Field field;
           try {
              field = getFieldFromHierarchy(getPersistentClass(), pair.getKey());
@@ -1439,17 +1457,7 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
                 );
              }
 
-             // Existing validation checks
              validateUpdatableField(field, pair);
-
-             if (pair.getValue() != null && !field.getType().isAssignableFrom(pair.getValue().getClass())) {
-                throw new IllegalArgumentException(
-                   "Invalid value for field " + pair.getKey() +
-                      " can't set value:" + pair.getValue() +
-                      " expected type: " + field.getType().toString() +
-                      " but got: " + pair.getValue().getClass().getSimpleName());
-             }
-
              updateOperators.add(buildUpdateOperator(pair.getKey(), pair.getValue()));
           } catch (NoSuchFieldException | IllegalAccessException e) {
              throw new RuntimeException(e);
@@ -1651,6 +1659,7 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
     *
     * @param pairs the field/value pairs to apply
     * @return the operators to include in the update
+    * @throws NotSupportedException    if a pair targets a managed reference or an ontology property
     * @throws IllegalArgumentException if a pair targets a reserved field, supplies a value of the
     *                                  wrong type, or supplies null for a non-nullable field
     */
@@ -1658,21 +1667,11 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
     private  List<UpdateOperator> buildValidatedUpdateOperators(@NotNull Pair<String, Object>... pairs) {
         Objects.requireNonNull(pairs, "update pairs must not be null");
         List<UpdateOperator> updateOperators = new ArrayList<>();
-        List<String> reservedFields = List.of("refName", "id", "version", "references", "auditInfo", "persistentEvents");
         for (Pair<String, Object> pair : pairs) {
-            if (reservedFields.contains(pair.getKey())) {
-                throw new IllegalArgumentException("Field:" + pair.getKey() + " is a reserved field and can't be updated");
-            }
             Field field;
             try {
                 field = getFieldFromHierarchy(getPersistentClass(), pair.getKey());
                 validateUpdatableField(field, pair);
-                if (pair.getValue() != null && !field.getType().isAssignableFrom(pair.getValue().getClass())) {
-                    throw new IllegalArgumentException("Invalid value for field " + pair.getKey() +
-                            " can't set value:" + pair.getValue() +
-                            " expected type: " + field.getType() +
-                            " but got: " + pair.getValue().getClass().getSimpleName());
-                }
                 updateOperators.add(buildUpdateOperator(pair.getKey(), pair.getValue()));
             } catch (NoSuchFieldException e) {
                 throw new RuntimeException(e);

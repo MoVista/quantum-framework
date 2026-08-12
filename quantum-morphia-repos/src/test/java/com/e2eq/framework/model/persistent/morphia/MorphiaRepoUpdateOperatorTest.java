@@ -6,6 +6,7 @@ import dev.morphia.query.updates.UpdateOperator;
 import org.apache.commons.lang3.tuple.Pair;
 import org.junit.jupiter.api.Test;
 
+import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.util.List;
@@ -58,6 +59,41 @@ class MorphiaRepoUpdateOperatorTest {
             } catch (InvocationTargetException e) {
                 // Surface what the method actually threw rather than the reflection wrapper.
                 if (e.getCause() instanceof Exception cause) {
+                    throw cause;
+                }
+                throw e;
+            }
+        }
+
+        /**
+         * Calls the single validation method that every pair-based update path (including the
+         * {@code MorphiaSession} overloads, which have no other guard of their own) routes through,
+         * so a test here proves the check applies everywhere, not just to the bulk paths.
+         *
+         * <p>{@code fieldName} is resolved up the class hierarchy the same way production code does,
+         * since some reserved field names (e.g. {@code version}) live on a base class rather than on
+         * {@link UpdateTestModel} itself.
+         */
+        void callValidateUpdatableField(String fieldName, Object value) throws Exception {
+            Class<?> current = UpdateTestModel.class;
+            Field field = null;
+            while (current != null) {
+                try {
+                    field = current.getDeclaredField(fieldName);
+                    break;
+                } catch (NoSuchFieldException e) {
+                    current = current.getSuperclass();
+                }
+            }
+            if (field == null) {
+                throw new NoSuchFieldException(fieldName);
+            }
+            Method method = MorphiaRepo.class.getDeclaredMethod("validateUpdatableField", Field.class, Pair.class);
+            method.setAccessible(true);
+            try {
+                method.invoke(this, field, Pair.of(fieldName, value));
+            } catch (InvocationTargetException e) {
+                if (e.getCause() instanceof RuntimeException cause) {
                     throw cause;
                 }
                 throw e;
@@ -135,5 +171,37 @@ class MorphiaRepoUpdateOperatorTest {
         assertThrows(
                 IllegalArgumentException.class,
                 () -> repo.callBuildValidatedUpdateOperators(Pair.of("refName", null)));
+    }
+
+    @Test
+    void reservedField_isRejectedByTheSharedValidationEveryPathUses() {
+        // Guards every pair-based update path, including the MorphiaSession overloads that have no
+        // reserved-field check of their own.
+        assertThrows(IllegalArgumentException.class, () -> repo.callValidateUpdatableField("refName", "PG-1"));
+    }
+
+    @Test
+    void wrongTypeValue_isRejectedForNonEnumField() {
+        // Guards every pair-based update path against a value of the wrong runtime type, including
+        // the MorphiaSession overloads, which previously only checked enum fields.
+        IllegalArgumentException e = assertThrows(
+                IllegalArgumentException.class, () -> repo.callValidateUpdatableField("note", 42));
+
+        assertTrue(
+                e.getMessage().contains("Invalid value for field note"),
+                "Unexpected message: " + e.getMessage());
+    }
+
+    @Test
+    void wrongTypeValue_isRejectedForEnumField() {
+        // An enum-typed field must reject a non-enum value even when its toString() happens to
+        // match a constant's name: the enum-constant check alone is not sufficient type safety.
+        IllegalArgumentException e = assertThrows(
+                IllegalArgumentException.class,
+                () -> repo.callValidateUpdatableField("requiredSeverity", "HIGH"));
+
+        assertTrue(
+                e.getMessage().contains("Invalid value for field requiredSeverity"),
+                "Unexpected message: " + e.getMessage());
     }
 }
