@@ -624,14 +624,19 @@ public class CognitoAuthProvider extends BaseAuthProvider implements AuthProvide
        return createUser( userId, password, forceChangePassword, roles, domainContext, null);
    }
 
-
-
-
    @Override
    public String createUser ( String userId, String password, Boolean forceChangePassword,
                          Set<String> roles, DomainContext domainContext, DataDomain dataDomain) {
+      return createUser(userId, password, forceChangePassword, roles, domainContext, dataDomain, null);
+   }
+
+   @Override
+   public String createUser ( String userId, String password, Boolean forceChangePassword,
+                         Set<String> roles, DomainContext domainContext, DataDomain dataDomain,
+                         Boolean portalAccess) {
      requireValidEmail(userId);
      roles = (roles != null) ? roles : Collections.emptySet();
+     boolean stampPortalAccess = resolvePortalAccess(portalAccess, roles);
      String subject;
 
      if (isCognitoDisabled()) {
@@ -655,7 +660,8 @@ public class CognitoAuthProvider extends BaseAuthProvider implements AuthProvide
                      .username(cognitoUsername)
                      .userAttributes(
                          AttributeType.builder().name("email").value(userId).build(),
-                         AttributeType.builder().name("email_verified").value("true").build()
+                         AttributeType.builder().name("email_verified").value("true").build(),
+                         portalAccessAttribute(stampPortalAccess)
                      )
                      .build());
               } catch (Exception ex) {
@@ -678,11 +684,12 @@ public class CognitoAuthProvider extends BaseAuthProvider implements AuthProvide
            }
         } else {
            subject = ocognitoSub.get();
+           // Existing Cognito user being reused — keep email-routing stamp aligned with create intent.
+           setPortalAccessAttribute(cognitoUsername, stampPortalAccess);
         }
      } else {
         // 1.1) If no existing Cognito user, create a new user
         // Build AdminCreateUser request conditionally based on whether a temp password was provided
-        boolean portalAccess = rolesGrantPortalAccess(roles);
         AdminCreateUserRequest.Builder createBuilder = AdminCreateUserRequest.builder()
             .userPoolId(userPoolId)
             .username(userId)
@@ -690,7 +697,7 @@ public class CognitoAuthProvider extends BaseAuthProvider implements AuthProvide
                 AttributeType.builder().name("email").value(userId).build(),
                 AttributeType.builder().name("email_verified").value("true").build(),
                 // Must be on AdminCreateUser so CustomEmailSender sees it for the invite email.
-                portalAccessAttribute(portalAccess)
+                portalAccessAttribute(stampPortalAccess)
             );
 
         // If a temp password is provided, pass it through; otherwise let Cognito generate one and send the invite email
@@ -1143,6 +1150,17 @@ public class CognitoAuthProvider extends BaseAuthProvider implements AuthProvide
         if (!ValidateUtils.isValidEmailAddress(userId)) {
             throw new IllegalArgumentException("UserId should be a valid email address, given: " + userId);
         }
+    }
+
+    /**
+     * Resolves Cognito {@code custom:portalAccess}. Explicit {@code portalAccess} wins;
+     * {@code null} falls back to {@link #rolesGrantPortalAccess(Set)}.
+     */
+    static boolean resolvePortalAccess(Boolean portalAccess, Set<String> roles) {
+        if (portalAccess != null) {
+            return portalAccess;
+        }
+        return rolesGrantPortalAccess(roles);
     }
 
     static boolean rolesGrantPortalAccess(Set<String> roles) {

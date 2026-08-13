@@ -31,4 +31,13 @@ class CognitoAuthProviderPortalAccessTest {
     void userAloneDoesNotGrantPortalAccess() {
         assertFalse(CognitoAuthProvider.rolesGrantPortalAccess(Set.of("user")));
     }
+
+    @Test
+    void explicitPortalAccessOverridesRoleHeuristic() {
+        assertTrue(CognitoAuthProvider.resolvePortalAccess(Boolean.TRUE, Set.of("user")));
+        assertTrue(CognitoAuthProvider.resolvePortalAccess(Boolean.TRUE, Collections.emptySet()));
+        assertFalse(CognitoAuthProvider.resolvePortalAccess(Boolean.FALSE, Set.of("admin")));
+        assertFalse(CognitoAuthProvider.resolvePortalAccess(null, Set.of("user")));
+        assertTrue(CognitoAuthProvider.resolvePortalAccess(null, Set.of("portal-associate")));
+    }
 }
