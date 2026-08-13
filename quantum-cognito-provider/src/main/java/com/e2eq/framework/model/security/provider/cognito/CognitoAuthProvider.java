@@ -689,28 +689,23 @@ public class CognitoAuthProvider extends BaseAuthProvider implements AuthProvide
         }
      } else {
         // 1.1) If no existing Cognito user, create a new user
-        // Build AdminCreateUser request conditionally based on whether a temp password was provided
-        AdminCreateUserRequest.Builder createBuilder = AdminCreateUserRequest.builder()
-            .userPoolId(userPoolId)
-            .username(userId)
-            .userAttributes(
-                AttributeType.builder().name("email").value(userId).build(),
-                AttributeType.builder().name("email_verified").value("true").build(),
-                // Must be on AdminCreateUser so CustomEmailSender sees it for the invite email.
-                portalAccessAttribute(stampPortalAccess)
-            );
-
-        // If a temp password is provided, pass it through; otherwise let Cognito generate one and send the invite email
-        if (password != null && !password.isBlank()) {
-            createBuilder.temporaryPassword(password)
-                         .messageAction(MessageActionType.SUPPRESS); // keep suppression when we provide the temp password ourselves
-        } else {
-            // send email invite
-            createBuilder
-                        .desiredDeliveryMediums(DeliveryMediumType.EMAIL);
+        // Prefer stamping custom:portalAccess on AdminCreateUser so CustomEmailSender sees it for the
+        // invite email. If the user-pool schema has not been deployed yet, retry without the attribute.
+        AdminCreateUserResponse createResp;
+        try {
+           createResp = cognitoClient.adminCreateUser(
+               buildAdminCreateUserRequest(userId, password, stampPortalAccess, true));
+        } catch (CognitoIdentityProviderException e) {
+           if (!isMissingPortalAccessSchemaError(e)) {
+              throw e;
+           }
+           Log.warnf(
+               "custom:portalAccess not available on user pool yet; creating userId:%s without stamp: %s",
+               userId,
+               e.awsErrorDetails() != null ? e.awsErrorDetails().errorMessage() : e.getMessage());
+           createResp = cognitoClient.adminCreateUser(
+               buildAdminCreateUserRequest(userId, password, stampPortalAccess, false));
         }
-
-        AdminCreateUserResponse createResp = cognitoClient.adminCreateUser(createBuilder.build());
 
         // If password was provided and forceChangePassword is false (or null),
         // set as permanent password so user doesn't need to change it on first login.
@@ -1182,6 +1177,49 @@ public class CognitoAuthProvider extends BaseAuthProvider implements AuthProvide
             .build();
     }
 
+    private AdminCreateUserRequest buildAdminCreateUserRequest(
+          String userId, String password, boolean stampPortalAccess, boolean includePortalAccessAttr) {
+        List<AttributeType> attrs = new ArrayList<>();
+        attrs.add(AttributeType.builder().name("email").value(userId).build());
+        attrs.add(AttributeType.builder().name("email_verified").value("true").build());
+        if (includePortalAccessAttr) {
+           attrs.add(portalAccessAttribute(stampPortalAccess));
+        }
+
+        AdminCreateUserRequest.Builder createBuilder = AdminCreateUserRequest.builder()
+            .userPoolId(userPoolId)
+            .username(userId)
+            .userAttributes(attrs);
+
+        if (password != null && !password.isBlank()) {
+            createBuilder.temporaryPassword(password)
+                         .messageAction(MessageActionType.SUPPRESS);
+        } else {
+            createBuilder.desiredDeliveryMediums(DeliveryMediumType.EMAIL);
+        }
+        return createBuilder.build();
+    }
+
+    /**
+     * Cognito rejects unknown custom attributes with InvalidParameterException when the pool schema
+     * has not been updated yet (CDK deploy lag).
+     */
+    private static boolean isMissingPortalAccessSchemaError(CognitoIdentityProviderException e) {
+        if (e == null) {
+           return false;
+        }
+        String code = e.awsErrorDetails() != null ? e.awsErrorDetails().errorCode() : null;
+        String message = e.awsErrorDetails() != null ? e.awsErrorDetails().errorMessage() : e.getMessage();
+        if (message == null) {
+           message = "";
+        }
+        String lower = message.toLowerCase(Locale.ROOT);
+        boolean mentionsPortalAccess =
+           lower.contains("portalaccess") || lower.contains(PORTAL_ACCESS_ATTR.toLowerCase(Locale.ROOT));
+        return mentionsPortalAccess
+           && ("InvalidParameterException".equals(code) || e instanceof InvalidParameterException);
+    }
+
     private void setPortalAccessAttribute(String userId, boolean portalAccess) {
         try {
             cognitoClient.adminUpdateUserAttributes(AdminUpdateUserAttributesRequest.builder()
@@ -1268,11 +1306,9 @@ public class CognitoAuthProvider extends BaseAuthProvider implements AuthProvide
             // Normalize target roles (null-safe)
             Set<String> targetRoles = (roles == null) ? Collections.emptySet() : new HashSet<>(roles);
 
-            // Portal-access promotion (and any grant of portal roles) flips the email-routing stamp.
-            // Do this even when Cognito groups already match, so a missing attribute can be repaired.
-            if (rolesGrantPortalAccess(targetRoles)) {
-               setPortalAccessAttribute(userId, true);
-            }
+            // Keep email-routing stamp aligned with the target role set (true or false), even when
+            // Cognito groups already match, so a missing/stale attribute can be repaired.
+            setPortalAccessAttribute(userId, rolesGrantPortalAccess(targetRoles));
 
             // Fetch only Cognito groups for reconciliation (exclude local credential roles)
             Set<String> currentCognitoGroups = getCognitoGroupsForUserIdOnly(userId);
