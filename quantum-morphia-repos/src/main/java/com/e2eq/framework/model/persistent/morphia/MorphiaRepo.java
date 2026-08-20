@@ -39,8 +39,16 @@ import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotEmpty;
 import jakarta.ws.rs.NotSupportedException;
 import jakarta.ws.rs.PathParam;
+import com.mongodb.client.FindIterable;
+import com.mongodb.client.MongoCollection;
+import com.mongodb.client.MongoCursor;
 import org.apache.commons.lang3.NotImplementedException;
 import org.apache.commons.lang3.tuple.Pair;
+import org.bson.BsonDocument;
+import org.bson.BsonDocumentReader;
+import org.bson.codecs.Codec;
+import org.bson.codecs.DecoderContext;
+import org.bson.codecs.configuration.CodecConfigurationException;
 import org.bson.types.ObjectId;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jetbrains.annotations.NotNull;
@@ -369,7 +377,6 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
         List<Filter> filters = new ArrayList<>();
         filters = securityFilterBuilder().buildSecuredFilters(filters, getPersistentClass());
 
-        MorphiaCursor<T> cursor;
         List<ProjectionField> projectionFields = new ArrayList<>();
         projectionFields.add(new ProjectionField( "refName", ProjectionField.ProjectionType.INCLUDE));
         projectionFields.add(new ProjectionField( "id", ProjectionField.ProjectionType.INCLUDE));
@@ -383,28 +390,19 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
                 Filter filter = MorphiaUtils.convertToFilter(query, getPersistentClass());
                 filters.add(Filters.and(filter));
             }
-            Filter[] filterArray = new Filter[filters.size()];
-            cursor = datastore.find(getPersistentClass())
-                    .filter(filters.toArray(filterArray))
-                    .iterator(findOptions);
-        } else {
-            Filter[] filterArray = new Filter[filters.size()];
-            cursor = datastore.find(getPersistentClass())
-                    .filter(filters.toArray(filterArray))
-                    .iterator(findOptions);
         }
+        Filter[] filterArray = new Filter[filters.size()];
+        Query<T> entityRefQuery = datastore.find(getPersistentClass())
+                .filter(filters.toArray(filterArray));
 
         List<EntityReference> list = new ArrayList<>();
         String realmId = datastore.getDatabase().getName();
-        try (cursor) {
-            EntityReference entityReference;
-            for (T model : cursor.toList()) {
-                UIActionList uiActions = model.calculateStateBasedUIActions();
-                model.setActionList(uiActions);
-                model.setModelSourceRealm(realmId);
-                entityReference = model.createEntityReference();
-                list.add(entityReference);
-            }
+        for (T model : toListSkippingUnparseable(datastore, entityRefQuery, findOptions)) {
+            UIActionList uiActions = model.calculateStateBasedUIActions();
+            model.setActionList(uiActions);
+            model.setModelSourceRealm(realmId);
+            EntityReference entityReference = model.createEntityReference();
+            list.add(entityReference);
         }
 
         return list;
@@ -530,6 +528,111 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
         }
     }
 
+    // -- Skip-unparseable-document support -------------------------------------------------
+    //
+    // Morphia (via the Mongo driver) decodes an entire network batch of documents as a single
+    // unit -- both the initial `find` response and every later `getMore` response -- so
+    // wrapping a single `cursor.next()` call in a try/catch is not enough: one document that
+    // can't be mapped (e.g. it stores an enum value no longer present in the Java enum) fails
+    // decoding of the whole batch, including otherwise-valid sibling documents in that same
+    // batch. To recover, we re-run the same query but decode raw BSON one document at a time
+    // via the entity's codec so only the bad document(s) are skipped (and logged). This slow
+    // path is only ever taken *after* the normal, fast, natively-typed path has failed, so the
+    // happy path (no unparseable documents) costs nothing extra.
+
+    /**
+     * True if {@code e} (or a cause in its chain) looks like a per-document mapping/decode
+     * failure -- e.g. {@code Enum.valueOf} rejecting a value stored in Mongo that no longer
+     * exists as a Java enum constant, or a codec refusing to decode a value -- as opposed to
+     * a broader infrastructure or programming error that should still fail the whole fetch.
+     */
+    protected static boolean isUnparseableDocumentException(RuntimeException e) {
+        Throwable t = e;
+        while (t != null) {
+            if (t instanceof IllegalArgumentException || t instanceof CodecConfigurationException) {
+                return true;
+            }
+            t = t.getCause();
+        }
+        return false;
+    }
+
+    private Codec<T> codecFor(Datastore datastore) {
+        return ((MorphiaDatastore) datastore).getCodecRegistry().get(getPersistentClass());
+    }
+
+    /**
+     * Opens a cursor of raw {@link BsonDocument}s for {@code query}/{@code findOptions},
+     * bypassing Morphia's entity codec entirely so that a document which can't be mapped to
+     * {@code T} doesn't prevent other documents in the same network batch from being read.
+     */
+    private MongoCursor<BsonDocument> openRawCursor(Datastore datastore, MorphiaQuery<T> query, FindOptions findOptions) {
+        MorphiaDatastore morphiaDatastore = (MorphiaDatastore) datastore;
+        Mapper mapper = morphiaDatastore.getMapper();
+        String collectionName = mapper.getEntityModel(getPersistentClass()).collectionName();
+        MongoCollection<BsonDocument> rawCollection = morphiaDatastore.getDatabase()
+                .getCollection(collectionName, BsonDocument.class);
+        FindIterable<BsonDocument> rawIterable = findOptions.apply(rawCollection.find(query.toDocument()), mapper, getPersistentClass());
+        return rawIterable.iterator();
+    }
+
+    /**
+     * Decodes {@code raw} into {@code T} using {@code codec}. If decoding fails with what
+     * looks like an unparseable document (see {@link #isUnparseableDocumentException}), logs a
+     * warning and returns {@link Optional#empty()} instead of throwing.
+     */
+    private Optional<T> decodeSkippingUnparseable(Codec<T> codec, BsonDocument raw) {
+        try {
+            return Optional.of(codec.decode(new BsonDocumentReader(raw), DecoderContext.builder().build()));
+        } catch (RuntimeException e) {
+            if (!isUnparseableDocumentException(e)) {
+                throw e;
+            }
+            Log.warnf(e, "Skipping document (_id=%s) in collection for %s that could not be mapped: %s",
+                    raw.get("_id"), getPersistentClass().getSimpleName(), e.getMessage());
+            return Optional.empty();
+        }
+    }
+
+    /**
+     * Convenience overload using default {@link FindOptions} (no skip/limit/sort/projection).
+     */
+    protected List<T> toListSkippingUnparseable(Datastore datastore, Query<T> query) {
+        return toListSkippingUnparseable(datastore, query, new FindOptions());
+    }
+
+    /**
+     * Runs {@code query.iterator(findOptions).toList()} -- the normal, fast path. If decoding
+     * fails because a document could not be mapped to {@code T}, re-executes the same query
+     * decoding documents one at a time (see {@link #decodeSkippingUnparseable}) so only the
+     * unparseable document(s) are skipped -- and a warning logged -- instead of failing the
+     * whole fetch. Any other exception propagates and aborts the fetch as before.
+     */
+    protected List<T> toListSkippingUnparseable(Datastore datastore, Query<T> query, FindOptions findOptions) {
+        try {
+            try (MorphiaCursor<T> cursor = query.iterator(findOptions)) {
+                return cursor.toList();
+            }
+        } catch (RuntimeException e) {
+            if (!(datastore instanceof MorphiaDatastore) || !(query instanceof MorphiaQuery) || !isUnparseableDocumentException(e)) {
+                throw e;
+            }
+            Log.warnf("Batch decode failed while listing %s (%s); retrying with per-document decoding so unparseable documents can be skipped",
+                    getPersistentClass().getSimpleName(), e.getMessage());
+
+            @SuppressWarnings("unchecked")
+            MorphiaQuery<T> morphiaQuery = (MorphiaQuery<T>) query;
+            Codec<T> codec = codecFor(datastore);
+            List<T> list = new ArrayList<>();
+            try (MongoCursor<BsonDocument> rawCursor = openRawCursor(datastore, morphiaQuery, findOptions)) {
+                while (rawCursor.hasNext()) {
+                    decodeSkippingUnparseable(codec, rawCursor.next()).ifPresent(list::add);
+                }
+            }
+            return list;
+        }
+    }
+
     @Override
     public CloseableIterator<T> getStreamByQuery(Datastore datastore, int skip, int limit, @Nullable String query, @Nullable List<SortField> sortFields, @Nullable List<ProjectionField> projectionFields) {
         if (skip < 0) {
@@ -550,18 +653,29 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
         }
 
         Filter[] filterArray = new Filter[filters.size()];
-        MorphiaCursor<T> cursor = datastore.find(getPersistentClass())
-                .filter(filters.toArray(filterArray))
-                .iterator(findOptions);
+        Query<T> streamQuery = datastore.find(getPersistentClass())
+                .filter(filters.toArray(filterArray));
+        MorphiaCursor<T> typedCursor = streamQuery.iterator(findOptions);
 
         return new CloseableIterator<>() {
             private static final int BATCH_SIZE = 1000; // Adjust this value as needed
             private final List<T> batch = new ArrayList<>(BATCH_SIZE);
             private int currentIndex = 0;
+            // Once a batch decode fails (see fetchNextBatch), we fall back to a raw cursor
+            // that decodes one document at a time for the remainder of the stream; totalYielded
+            // lets us resume at the right skip offset instead of re-yielding earlier documents.
+            private MorphiaCursor<T> typed = typedCursor;
+            private MongoCursor<BsonDocument> raw;
+            private int totalYielded = 0;
 
             @Override
             public void close() {
-                cursor.close();
+                if (typed != null) {
+                    typed.close();
+                }
+                if (raw != null) {
+                    raw.close();
+                }
             }
 
             @Override
@@ -578,6 +692,7 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
                     return null;
                 }
                 T model = batch.get(currentIndex++);
+                totalYielded++;
                 processModel(model);
                 return model;
             }
@@ -585,10 +700,44 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
             private boolean fetchNextBatch() {
                 batch.clear();
                 currentIndex = 0;
-                for (int i = 0; i < BATCH_SIZE && cursor.hasNext(); i++) {
-                    batch.add(cursor.next());
+
+                if (raw != null) {
+                    fetchNextRawBatch();
+                    return !batch.isEmpty();
+                }
+
+                try {
+                    while (batch.size() < BATCH_SIZE && typed.hasNext()) {
+                        batch.add(typed.next());
+                    }
+                } catch (RuntimeException e) {
+                    if (!(datastore instanceof MorphiaDatastore) || !(streamQuery instanceof MorphiaQuery) || !isUnparseableDocumentException(e)) {
+                        throw e;
+                    }
+                    Log.warnf("Batch decode failed while streaming %s (%s); switching to per-document decoding for the remainder of this stream so unparseable documents can be skipped",
+                            getPersistentClass().getSimpleName(), e.getMessage());
+                    batch.clear();
+                    typed.close();
+                    typed = null;
+
+                    if (limit > 0 && totalYielded >= limit) {
+                        return false;
+                    }
+                    int resumeLimit = limit > 0 ? limit - totalYielded : 0;
+                    FindOptions resumeOptions = buildFindOptions(skip + totalYielded, resumeLimit, sortFields, projectionFields);
+                    @SuppressWarnings("unchecked")
+                    MorphiaQuery<T> morphiaQuery = (MorphiaQuery<T>) streamQuery;
+                    raw = openRawCursor(datastore, morphiaQuery, resumeOptions);
+                    fetchNextRawBatch();
                 }
                 return !batch.isEmpty();
+            }
+
+            private void fetchNextRawBatch() {
+                Codec<T> codec = codecFor(datastore);
+                while (batch.size() < BATCH_SIZE && raw.hasNext()) {
+                    decodeSkippingUnparseable(codec, raw.next()).ifPresent(batch::add);
+                }
             }
 
             private void processModel(T model) {
@@ -610,9 +759,6 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
         List<Filter> filters = new ArrayList<>();
         filters = securityFilterBuilder().buildSecuredFilters(filters, getPersistentClass());
 
-
-        MorphiaCursor<T> cursor;
-
         FindOptions findOptions = buildFindOptions(skip, limit, sortFields, projectionFields);
 
         if (query != null && !query.isEmpty()) {
@@ -623,26 +769,18 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
                 Log.debugf("Running with filters:%s", filters.stream().map(Filter::toString).collect(Collectors.joining(",")));
 
             }
-            Filter[] filterArray = new Filter[filters.size()];
-            cursor = datastore.find(getPersistentClass())
-                    .filter(filters.toArray(filterArray))
-                    .iterator(findOptions);
-        } else {
-            Filter[] filterArray = new Filter[filters.size()];
-            cursor = datastore.find(getPersistentClass())
-                    .filter(filters.toArray(filterArray))
-                    .iterator(findOptions);
         }
+        Filter[] filterArray = new Filter[filters.size()];
+        Query<T> listQuery = datastore.find(getPersistentClass())
+                .filter(filters.toArray(filterArray));
 
         List<T> list = new ArrayList<>();
         String realm = datastore.getDatabase().getName();
-        try (cursor) {
-            for (T model : cursor.toList()) {
-                UIActionList uiActions = model.calculateStateBasedUIActions();
-                model.setActionList(uiActions);
-                model.setModelSourceRealm(realm);
-                list.add(model);
-            }
+        for (T model : toListSkippingUnparseable(datastore, listQuery, findOptions)) {
+            UIActionList uiActions = model.calculateStateBasedUIActions();
+            model.setActionList(uiActions);
+            model.setModelSourceRealm(realm);
+            list.add(model);
         }
 
         return list;
@@ -690,22 +828,17 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
         // Add filters based upon rule and resourceContext;
         Filter[] filterArray = getFilterArray(filters, getPersistentClass());
 
-        MorphiaCursor<T> cursor;
-
-        cursor = datastore.find(getPersistentClass())
-                .filter(filterArray)
-                .iterator(findOptions);
+        Query<T> listQuery = datastore.find(getPersistentClass())
+                .filter(filterArray);
 
         List<T> list = new ArrayList<>();
         String realm = datastore.getDatabase().getName();
-        try (cursor) {
-            for (T model : cursor.toList()) {
-                UIActionList uiActions = model.calculateStateBasedUIActions();
-                model.setActionList(uiActions);
+        for (T model : toListSkippingUnparseable(datastore, listQuery, findOptions)) {
+            UIActionList uiActions = model.calculateStateBasedUIActions();
+            model.setActionList(uiActions);
 
-                model.setModelSourceRealm(realm);
-                list.add(model);
-            }
+            model.setModelSourceRealm(realm);
+            list.add(model);
         }
 
         return list;
@@ -734,10 +867,11 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
         FindOptions findOptions = new FindOptions();
 
         Filter[] filterArray = new Filter[filters.size()];
-        Query<T> query = morphiaDataStoreWrapper.getDataStore(getSecurityContextRealmId()).find(getPersistentClass())
+        Datastore queryDatastore = morphiaDataStoreWrapper.getDataStore(getSecurityContextRealmId());
+        Query<T> query = queryDatastore.find(getPersistentClass())
                 .filter(filters.toArray(filterArray));
 
-        List<T> list = query.iterator(findOptions).toList();
+        List<T> list = toListSkippingUnparseable(queryDatastore, query, findOptions);
 
         String realm = datastore.getDatabase().getName();
         for (T model : list) {
@@ -771,10 +905,11 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
        String realm= getSecurityContextRealmId();
 
         Filter[] filterArray = new Filter[filters.size()];
-        Query<T> query = morphiaDataStoreWrapper.getDataStore(realm).find(getPersistentClass())
+        Datastore queryDatastore = morphiaDataStoreWrapper.getDataStore(realm);
+        Query<T> query = queryDatastore.find(getPersistentClass())
                 .filter(filters.toArray(filterArray));
 
-        List<T> list = query.iterator(findOptions).toList();
+        List<T> list = toListSkippingUnparseable(queryDatastore, query, findOptions);
 
         for (T model : list) {
             UIActionList uiActions = model.calculateStateBasedUIActions();
