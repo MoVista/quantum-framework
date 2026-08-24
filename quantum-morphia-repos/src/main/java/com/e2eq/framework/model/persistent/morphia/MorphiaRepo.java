@@ -57,6 +57,7 @@ import jakarta.enterprise.inject.Instance;
 
 import java.lang.reflect.Field;
 import java.util.*;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
 import static dev.morphia.query.Sort.ascending;
@@ -96,6 +97,17 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
 
     private volatile Collation cachedSortCollation;
     private volatile boolean sortCollationResolved;
+
+    // Safety valve for the skip-unparseable-document fallback (see the note above
+    // isUnparseableDocumentException): isUnparseableDocumentException matches any
+    // IllegalArgumentException in a decode failure's cause chain, which is intentionally broad
+    // so that unanticipated codec failures are still tolerated. If an unrelated bug were to make
+    // every document in a collection "unparseable", that broad match would otherwise silently
+    // return an empty (or heavily truncated) list/stream instead of surfacing the problem. Once
+    // more than this many documents are skipped within a single fetch, skip-unparseable aborts
+    // and rethrows the last decode failure instead of continuing.
+    @ConfigProperty(name = "quantum.morphia.maxSkippedUnparseableDocuments", defaultValue = "1000")
+    protected int maxSkippedUnparseableDocuments;
 
     private void callPostPersistHooks(String realmId, Object entity) {
         lifecycleHooks().callPostPersistHooks(realmId, entity);
@@ -577,16 +589,24 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
     }
 
     /**
-     * Decodes {@code raw} into {@code T} using {@code codec}. If decoding fails with what
-     * looks like an unparseable document (see {@link #isUnparseableDocumentException}), logs a
-     * warning and returns {@link Optional#empty()} instead of throwing.
+     * Decodes {@code raw} into {@code T} using {@code codec}. If decoding fails with what looks
+     * like an unparseable document (see {@link #isUnparseableDocumentException}), logs a warning
+     * and returns {@link Optional#empty()} instead of throwing -- unless {@code skippedCount} has
+     * already reached {@link #maxSkippedUnparseableDocuments} for this fetch, in which case the
+     * decode failure is rethrown rather than skipped (see the field javadoc for why).
      */
-    private Optional<T> decodeSkippingUnparseable(Codec<T> codec, BsonDocument raw) {
+    private Optional<T> decodeSkippingUnparseable(Codec<T> codec, BsonDocument raw, AtomicInteger skippedCount) {
         try {
             return Optional.of(codec.decode(new BsonDocumentReader(raw), DecoderContext.builder().build()));
         } catch (RuntimeException e) {
             if (!isUnparseableDocumentException(e)) {
                 throw e;
+            }
+            if (skippedCount.incrementAndGet() > maxSkippedUnparseableDocuments) {
+                throw new IllegalStateException(
+                        "Exceeded the limit of " + maxSkippedUnparseableDocuments
+                                + " unparseable documents skipped while fetching " + getPersistentClass().getSimpleName()
+                                + "; aborting instead of returning a heavily truncated result", e);
             }
             Log.warnf(e, "Skipping document (_id=%s) in collection for %s that could not be mapped: %s",
                     raw.get("_id"), getPersistentClass().getSimpleName(), e.getMessage());
@@ -624,15 +644,35 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
             MorphiaQuery<T> morphiaQuery = (MorphiaQuery<T>) query;
             Codec<T> codec = codecFor(datastore);
             List<T> list = new ArrayList<>();
+            AtomicInteger skippedCount = new AtomicInteger();
             try (MongoCursor<BsonDocument> rawCursor = openRawCursor(datastore, morphiaQuery, findOptions)) {
                 while (rawCursor.hasNext()) {
-                    decodeSkippingUnparseable(codec, rawCursor.next()).ifPresent(list::add);
+                    decodeSkippingUnparseable(codec, rawCursor.next(), skippedCount).ifPresent(list::add);
                 }
             }
             return list;
         }
     }
 
+    /**
+     * Streams query results, tolerating documents that can't be mapped to {@code T} (see the
+     * class-level note above {@link #isUnparseableDocumentException}).
+     *
+     * <p>Unlike {@link #toListSkippingUnparseable}, this can't try the fast typed path first and
+     * fall back on failure: by the time a batch decode fails, some documents from that batch may
+     * already have been handed to the caller, and re-running the query from a {@code skip}
+     * offset to "resume" is not safe -- a concurrent insert, delete, or update that shifts which
+     * documents fall before the resume point can cause the stream to duplicate or silently drop
+     * records. So instead, whenever the per-document skip-unparseable machinery is available, a
+     * single raw {@link BsonDocument} cursor is used for the entire stream, decoded one document
+     * at a time via the entity's codec; this is slightly slower than the batch-typed path but
+     * never needs to re-issue the query mid-stream.
+     *
+     * <p>As with {@link #toListSkippingUnparseable}, {@code limit} is applied server-side by
+     * Mongo, so an unparseable document within the limited window still counts against
+     * {@code limit} -- e.g. a stream with {@code limit=100} over a range containing one bad
+     * document yields 99 records.
+     */
     @Override
     public CloseableIterator<T> getStreamByQuery(Datastore datastore, int skip, int limit, @Nullable String query, @Nullable List<SortField> sortFields, @Nullable List<ProjectionField> projectionFields) {
         if (skip < 0) {
@@ -655,27 +695,27 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
         Filter[] filterArray = new Filter[filters.size()];
         Query<T> streamQuery = datastore.find(getPersistentClass())
                 .filter(filters.toArray(filterArray));
-        MorphiaCursor<T> typedCursor = streamQuery.iterator(findOptions);
+
+        // Defensive: the public signature accepts any Datastore/Query, though
+        // MorphiaDataStoreWrapper always hands back a MorphiaDatastore/MorphiaQuery pair.
+        if (!(datastore instanceof MorphiaDatastore) || !(streamQuery instanceof MorphiaQuery)) {
+            return typedCursorIterator(streamQuery.iterator(findOptions));
+        }
+
+        @SuppressWarnings("unchecked")
+        MorphiaQuery<T> morphiaQuery = (MorphiaQuery<T>) streamQuery;
+        Codec<T> codec = codecFor(datastore);
+        MongoCursor<BsonDocument> rawCursor = openRawCursor(datastore, morphiaQuery, findOptions);
 
         return new CloseableIterator<>() {
             private static final int BATCH_SIZE = 1000; // Adjust this value as needed
             private final List<T> batch = new ArrayList<>(BATCH_SIZE);
             private int currentIndex = 0;
-            // Once a batch decode fails (see fetchNextBatch), we fall back to a raw cursor
-            // that decodes one document at a time for the remainder of the stream; totalYielded
-            // lets us resume at the right skip offset instead of re-yielding earlier documents.
-            private MorphiaCursor<T> typed = typedCursor;
-            private MongoCursor<BsonDocument> raw;
-            private int totalYielded = 0;
+            private final AtomicInteger skippedCount = new AtomicInteger();
 
             @Override
             public void close() {
-                if (typed != null) {
-                    typed.close();
-                }
-                if (raw != null) {
-                    raw.close();
-                }
+                rawCursor.close();
             }
 
             @Override
@@ -689,10 +729,9 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
             @Override
             public T next() {
                 if (currentIndex >= batch.size() && !fetchNextBatch()) {
-                    return null;
+                    throw new NoSuchElementException();
                 }
                 T model = batch.get(currentIndex++);
-                totalYielded++;
                 processModel(model);
                 return model;
             }
@@ -700,51 +739,62 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
             private boolean fetchNextBatch() {
                 batch.clear();
                 currentIndex = 0;
-
-                if (raw != null) {
-                    fetchNextRawBatch();
-                    return !batch.isEmpty();
-                }
-
-                try {
-                    while (batch.size() < BATCH_SIZE && typed.hasNext()) {
-                        batch.add(typed.next());
-                    }
-                } catch (RuntimeException e) {
-                    if (!(datastore instanceof MorphiaDatastore) || !(streamQuery instanceof MorphiaQuery) || !isUnparseableDocumentException(e)) {
-                        throw e;
-                    }
-                    Log.warnf("Batch decode failed while streaming %s (%s); switching to per-document decoding for the remainder of this stream so unparseable documents can be skipped",
-                            getPersistentClass().getSimpleName(), e.getMessage());
-                    batch.clear();
-                    typed.close();
-                    typed = null;
-
-                    if (limit > 0 && totalYielded >= limit) {
-                        return false;
-                    }
-                    int resumeLimit = limit > 0 ? limit - totalYielded : 0;
-                    FindOptions resumeOptions = buildFindOptions(skip + totalYielded, resumeLimit, sortFields, projectionFields);
-                    @SuppressWarnings("unchecked")
-                    MorphiaQuery<T> morphiaQuery = (MorphiaQuery<T>) streamQuery;
-                    raw = openRawCursor(datastore, morphiaQuery, resumeOptions);
-                    fetchNextRawBatch();
+                while (batch.size() < BATCH_SIZE && rawCursor.hasNext()) {
+                    decodeSkippingUnparseable(codec, rawCursor.next(), skippedCount).ifPresent(batch::add);
                 }
                 return !batch.isEmpty();
             }
 
-            private void fetchNextRawBatch() {
-                Codec<T> codec = codecFor(datastore);
-                while (batch.size() < BATCH_SIZE && raw.hasNext()) {
-                    decodeSkippingUnparseable(codec, raw.next()).ifPresent(batch::add);
-                }
+            private void processModel(T model) {
+                UIActionList uiActions = model.calculateStateBasedUIActions();
+                model.setActionList(uiActions);
+            }
+        };
+    }
+
+    /**
+     * Wraps a plain {@link MorphiaCursor} in a {@link CloseableIterator}, batching reads the same
+     * way as the raw-cursor path above. Used only as a defensive fallback when the skip-unparseable
+     * machinery isn't applicable (non-{@link MorphiaDatastore}/{@link MorphiaQuery} inputs), in
+     * which case unparseable documents are not tolerated -- matching pre-existing behavior.
+     */
+    private CloseableIterator<T> typedCursorIterator(MorphiaCursor<T> cursor) {
+        return new CloseableIterator<>() {
+            private static final int BATCH_SIZE = 1000;
+            private final List<T> batch = new ArrayList<>(BATCH_SIZE);
+            private int currentIndex = 0;
+
+            @Override
+            public void close() {
+                cursor.close();
             }
 
-            private void processModel(T model) {
-                if (model != null) {
-                    UIActionList uiActions = model.calculateStateBasedUIActions();
-                    model.setActionList(uiActions);
+            @Override
+            public boolean hasNext() {
+                if (currentIndex < batch.size()) {
+                    return true;
                 }
+                return fetchNextBatch();
+            }
+
+            @Override
+            public T next() {
+                if (currentIndex >= batch.size() && !fetchNextBatch()) {
+                    throw new NoSuchElementException();
+                }
+                T model = batch.get(currentIndex++);
+                UIActionList uiActions = model.calculateStateBasedUIActions();
+                model.setActionList(uiActions);
+                return model;
+            }
+
+            private boolean fetchNextBatch() {
+                batch.clear();
+                currentIndex = 0;
+                while (batch.size() < BATCH_SIZE && cursor.hasNext()) {
+                    batch.add(cursor.next());
+                }
+                return !batch.isEmpty();
             }
         };
     }
@@ -867,11 +917,10 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
         FindOptions findOptions = new FindOptions();
 
         Filter[] filterArray = new Filter[filters.size()];
-        Datastore queryDatastore = morphiaDataStoreWrapper.getDataStore(getSecurityContextRealmId());
-        Query<T> query = queryDatastore.find(getPersistentClass())
+        Query<T> query = datastore.find(getPersistentClass())
                 .filter(filters.toArray(filterArray));
 
-        List<T> list = toListSkippingUnparseable(queryDatastore, query, findOptions);
+        List<T> list = toListSkippingUnparseable(datastore, query, findOptions);
 
         String realm = datastore.getDatabase().getName();
         for (T model : list) {
@@ -902,15 +951,14 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
         filters.add(Filters.in("refName", refNames));
 
         FindOptions findOptions = new FindOptions();
-       String realm= getSecurityContextRealmId();
 
         Filter[] filterArray = new Filter[filters.size()];
-        Datastore queryDatastore = morphiaDataStoreWrapper.getDataStore(realm);
-        Query<T> query = queryDatastore.find(getPersistentClass())
+        Query<T> query = datastore.find(getPersistentClass())
                 .filter(filters.toArray(filterArray));
 
-        List<T> list = toListSkippingUnparseable(queryDatastore, query, findOptions);
+        List<T> list = toListSkippingUnparseable(datastore, query, findOptions);
 
+        String realm = datastore.getDatabase().getName();
         for (T model : list) {
             UIActionList uiActions = model.calculateStateBasedUIActions();
             model.setActionList(uiActions);
