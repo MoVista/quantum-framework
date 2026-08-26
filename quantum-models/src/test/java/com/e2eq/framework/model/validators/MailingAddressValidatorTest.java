@@ -64,6 +64,20 @@ class MailingAddressValidatorTest {
         assertTrue(validator.isValidUsStateCode("PR"));
     }
 
+    @Test
+    void malformedExtensionCodesAreRejectedByLookup() {
+        MailingAddressValidator validator = validatorWithAdditionalCodes("AA", "ca", "AAA", "A1");
+        assertTrue(validator.isValidUsStateCode("AA"));
+        assertFalse(validator.isValidUsStateCode("ca"));
+        assertFalse(validator.isValidUsStateCode("AAA"));
+        assertFalse(validator.isValidUsStateCode("A1"));
+    }
+
+    @Test
+    void nullStateCodeIsRejected() {
+        assertFalse(new MailingAddressValidator().isValidUsStateCode(null));
+    }
+
     private static MailingAddressValidator validatorWithAdditionalCodes(String... codes) {
         MailingAddressValidator validator = new MailingAddressValidator();
         validator.additionalUsStateCodes = Set.of(codes);

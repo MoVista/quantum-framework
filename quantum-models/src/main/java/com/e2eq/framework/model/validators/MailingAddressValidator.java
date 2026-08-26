@@ -44,15 +44,26 @@ public class MailingAddressValidator implements ConstraintValidator<ValidMailing
         Set<String> codes = new HashSet<>();
         for (MailingAddressValidationExtension extension : extensions) {
             Set<String> extra = extension.additionalUsStateCodes();
-            if (extra != null) {
-                codes.addAll(extra);
+            if (extra == null) {
+                continue;
+            }
+            for (String code : extra) {
+                if (code != null && US_STATE_PATTERN.matcher(code).matches()) {
+                    codes.add(code);
+                }
             }
         }
-        additionalUsStateCodes = codes;
+        additionalUsStateCodes = Set.copyOf(codes);
     }
 
     boolean isValidUsStateCode(String code) {
-        return US_STATES_SET.contains(code) || additionalUsStateCodes.contains(code);
+        if (code == null) {
+            return false;
+        }
+        if (US_STATES_SET.contains(code)) {
+            return true;
+        }
+        return US_STATE_PATTERN.matcher(code).matches() && additionalUsStateCodes.contains(code);
     }
 
     @Override
