@@ -69,7 +69,7 @@ public class CredentialRepo extends MorphiaRepo<CredentialUserIdPassword> {
          return java.util.Collections.emptyList();
       }
 
-      CredentialUserIdPassword credential = ocred.get();
+      CredentialUserIdPassword credential = resolveRealmAccessCredential(ocred.get());
 
       List<Realm> realms = realmRepo.getAllListWithIgnoreRules(envConfigUtils.getSystemRealm());
       List<String> candidateRefNames = realms.stream().map(Realm::getRefName).collect(Collectors.toList());
@@ -92,6 +92,32 @@ public class CredentialRepo extends MorphiaRepo<CredentialUserIdPassword> {
                  return new com.e2eq.framework.rest.models.RealmInfo(refName, tenantId);
               })
               .collect(Collectors.toList());
+   }
+
+   /**
+    * Returns the credential whose {@code realmRegEx}/{@code authorizedRealms} should be used for
+    * X-Realm checks. SERVICE_TOKEN credentials that were minted without copying those fields
+    * inherit them from {@code parentCredentialSubject} so they can act across the same realms as
+    * the owning admin.
+    *
+    * @param credential the authenticated credential; must not be null
+    * @return the parent credential when inheritance applies and the parent exists, otherwise
+    *         {@code credential}
+    */
+   public CredentialUserIdPassword resolveRealmAccessCredential(@NotNull CredentialUserIdPassword credential) {
+      if (!securityUtils.shouldInheritParentRealmAccess(credential)) {
+         return credential;
+      }
+      Optional<CredentialUserIdPassword> parent =
+              findBySubject(credential.getParentCredentialSubject(), envConfigUtils.getSystemRealm(), true);
+      if (parent.isEmpty()) {
+         Log.warnf(
+                 "SERVICE_TOKEN %s has parentCredentialSubject %s but parent was not found; using token realm grants",
+                 credential.getUserId(),
+                 credential.getParentCredentialSubject());
+         return credential;
+      }
+      return parent.get();
    }
 
    /**

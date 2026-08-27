@@ -916,7 +916,9 @@ public class SecurityFilter implements ContainerRequestFilter, jakarta.ws.rs.con
                     "The realm override %s is not a configured Realm RefName in the realm collection in the database:%s", realm, envConfigUtils.getSystemRealm()));
             }
 
-            List<String> realmsAuthorized = securityUtils.computeAllowedRealmRefNames(creds, realmRefNamesAvailable);
+            CredentialUserIdPassword realmAccessCreds = credentialRepo.resolveRealmAccessCredential(creds);
+            List<String> realmsAuthorized =
+                    securityUtils.computeAllowedRealmRefNames(realmAccessCreds, realmRefNamesAvailable);
             if (!realmsAuthorized.contains(realm)) {
                 throw new IllegalArgumentException(String.format(
                     "The user %s is not authorized to access realm %s", creds.getUserId(), realm));

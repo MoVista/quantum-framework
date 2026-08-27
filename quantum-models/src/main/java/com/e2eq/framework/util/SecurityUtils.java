@@ -1,6 +1,8 @@
 package com.e2eq.framework.util;
 
 import com.e2eq.framework.model.persistent.base.DataDomain;
+import com.e2eq.framework.model.security.CredentialType;
+import com.e2eq.framework.model.security.CredentialUserIdPassword;
 import com.e2eq.framework.model.security.DomainContext;
 
 import com.e2eq.framework.model.securityrules.*;
@@ -153,6 +155,48 @@ public class SecurityUtils {
 
 
 
+
+   /**
+    * True when the credential itself carries realm grants ({@code authorizedRealms} or
+    * {@code realmRegEx}). A SERVICE_TOKEN without either of those falls back to its parent
+    * (see {@link #shouldInheritParentRealmAccess(CredentialUserIdPassword)}).
+    *
+    * @param credential the credential to inspect; null is treated as no grants
+    * @return true if this credential has its own realm grants
+    */
+   public boolean hasExplicitRealmGrants(CredentialUserIdPassword credential) {
+      if (credential == null) {
+         return false;
+      }
+      var realms = credential.getAuthorizedRealms();
+      if (realms != null && !realms.isEmpty()) {
+         return true;
+      }
+      String regex = credential.getRealmRegEx();
+      return regex != null && !regex.isBlank();
+   }
+
+   /**
+    * SERVICE_TOKEN credentials inherit the parent's realm grants when they were minted without
+    * copying {@code realmRegEx}/{@code authorizedRealms}. Existing tokens remain usable because
+    * {@code parentCredentialSubject} is still present.
+    *
+    * @param credential the calling credential
+    * @return true when a parent lookup should supply realm access
+    */
+   public boolean shouldInheritParentRealmAccess(CredentialUserIdPassword credential) {
+      if (credential == null) {
+         return false;
+      }
+      if (credential.getCredentialType() != CredentialType.SERVICE_TOKEN) {
+         return false;
+      }
+      String parentSubject = credential.getParentCredentialSubject();
+      if (parentSubject == null || parentSubject.isBlank()) {
+         return false;
+      }
+      return !hasExplicitRealmGrants(credential);
+   }
 
    // Compute a list of allowed realm refNames for the given credential from a candidate set.
    // If authorizedRealms present, intersect candidates with that list; else if realmRegEx present, filter by it;

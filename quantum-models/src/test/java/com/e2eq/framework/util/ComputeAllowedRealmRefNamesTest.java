@@ -1,5 +1,6 @@
 package com.e2eq.framework.util;
 
+import com.e2eq.framework.model.security.CredentialType;
 import com.e2eq.framework.model.security.CredentialUserIdPassword;
 import com.e2eq.framework.model.security.DomainContext;
 import org.junit.jupiter.api.BeforeEach;
@@ -158,5 +159,47 @@ class ComputeAllowedRealmRefNamesTest {
         List<String> result = securityUtils.computeAllowedRealmRefNames(cred, candidates);
 
         assertEquals(List.of("acme-prod", "acme-dev", "other-realm"), result);
+    }
+
+    @Test
+    void hasExplicitRealmGrants_regex() {
+        assertTrue(securityUtils.hasExplicitRealmGrants(buildCredential(null, "*", "realm-a")));
+    }
+
+    @Test
+    void hasExplicitRealmGrants_authorizedRealms() {
+        assertTrue(securityUtils.hasExplicitRealmGrants(buildCredential(List.of(entry("realm-a")), null, "realm-a")));
+    }
+
+    @Test
+    void hasExplicitRealmGrants_neither() {
+        assertFalse(securityUtils.hasExplicitRealmGrants(buildCredential(null, null, "realm-a")));
+    }
+
+    @Test
+    void serviceTokenWithoutGrantsInheritsParent() {
+        CredentialUserIdPassword cred = buildCredential(null, null, "system-com");
+        cred.setCredentialType(CredentialType.SERVICE_TOKEN);
+        cred.setParentCredentialSubject("parent-sub");
+
+        assertTrue(securityUtils.shouldInheritParentRealmAccess(cred));
+    }
+
+    @Test
+    void serviceTokenWithOwnRegexDoesNotInherit() {
+        CredentialUserIdPassword cred = buildCredential(null, "*", "system-com");
+        cred.setCredentialType(CredentialType.SERVICE_TOKEN);
+        cred.setParentCredentialSubject("parent-sub");
+
+        assertFalse(securityUtils.shouldInheritParentRealmAccess(cred));
+    }
+
+    @Test
+    void passwordCredentialDoesNotInherit() {
+        CredentialUserIdPassword cred = buildCredential(null, null, "system-com");
+        cred.setCredentialType(CredentialType.PASSWORD);
+        cred.setParentCredentialSubject("parent-sub");
+
+        assertFalse(securityUtils.shouldInheritParentRealmAccess(cred));
     }
 }

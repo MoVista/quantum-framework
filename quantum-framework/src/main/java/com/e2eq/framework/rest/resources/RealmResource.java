@@ -93,7 +93,8 @@ public class RealmResource extends BaseResource<Realm, BaseMorphiaRepo<Realm>> {
          return Response.status(Response.Status.UNAUTHORIZED).entity(error).build();
       }
 
-      List<Realm> realms = ((RealmRepo) repo).computeAllowedRealms(ocredential.get());
+      List<Realm> realms =
+              ((RealmRepo) repo).computeAllowedRealms(credentialRepo.resolveRealmAccessCredential(ocredential.get()));
       return Response.ok(realms).build();
    }
 
@@ -131,7 +132,9 @@ public class RealmResource extends BaseResource<Realm, BaseMorphiaRepo<Realm>> {
          return Response.status(Response.Status.NOT_FOUND).entity(error).build();
       }
 
-      return Response.ok(((RealmRepo) repo).computeAllowedRealms(ocred.get())).build();
+      return Response.ok(((RealmRepo) repo)
+                      .computeAllowedRealms(credentialRepo.resolveRealmAccessCredential(ocred.get())))
+              .build();
    }
 
 }

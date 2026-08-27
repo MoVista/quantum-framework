@@ -479,7 +479,7 @@ public class SecurityResource {
         if (credential == null) {
             return List.of();
         }
-        return realmRepo.computeAllowedRealms(credential).stream()
+        return realmRepo.computeAllowedRealms(credentialRepo.resolveRealmAccessCredential(credential)).stream()
                 .map(AccessibleRealmInfo::fromRealm)
                 .toList();
     }

@@ -138,7 +138,8 @@ public class AuthResource {
     @Operation(summary = "Generate Service Token",
             description = "Generates a long-lived JWT token for service accounts, MCP servers, and API integrations. " +
                     "Creates a SERVICE_TOKEN credential linked to the caller's user profile. " +
-                    "Requires the 'custom' auth provider to be configured.")
+                    "Copies the caller's realmRegEx and authorizedRealms so the token can use X-Realm " +
+                    "against the same tenants as the caller. Requires the 'custom' auth provider to be configured.")
     @APIResponses({
             @APIResponse(responseCode = "200", description = "Service token generated and credential persisted"),
             @APIResponse(responseCode = "400", description = "Custom JWT provider not available or caller credential not found"),
@@ -185,6 +186,11 @@ public class AuthResource {
                     .issuer(ctp.getIssuer())
                     .authProviderName("custom")
                     .domainContext(callerCred.getDomainContext())
+                    .realmRegEx(callerCred.getRealmRegEx())
+                    .authorizedRealms(
+                            callerCred.getAuthorizedRealms() == null
+                                    ? null
+                                    : new ArrayList<>(callerCred.getAuthorizedRealms()))
                     .description(request.description())
                     .lastUpdate(new Date())
                     .refName(serviceUserId)
