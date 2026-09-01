@@ -1279,36 +1279,124 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
         throw new NoSuchFieldException("Field '" + fieldName + "' not found in class hierarchy of " + clazz.getName());
     }
 
+    /**
+     * Builds the update operator for a single field/value pair.
+     *
+     * <p>A {@code null} value means "clear this field" and is translated to {@code $unset} rather
+     * than {@code $set: null}. That leaves the document in the same shape it would have if the
+     * entity had been persisted with the property unset, since Morphia does not store nulls by
+     * default, so reads are consistent regardless of which write path produced the document.
+     *
+     * @param fieldName the mapped field name to update
+     * @param value     the new value, or {@code null} to clear the field
+     * @return the operator that applies the requested change
+     */
+    private static UpdateOperator buildUpdateOperator(@NotNull String fieldName, Object value) {
+        return value == null
+                ? UpdateOperators.unset(fieldName)
+                : UpdateOperators.set(fieldName, value);
+    }
+
+    /**
+     * Fields that every pair-based update path rejects outright, regardless of value: they are
+     * either identity/concurrency metadata ({@code refName}, {@code id}, {@code version}),
+     * maintained by the framework itself ({@code auditInfo}, {@code persistentEvents}), or a
+     * managed relationship ({@code references}) that must go through {@code save()}.
+     */
+    private static final List<String> RESERVED_UPDATE_FIELDS =
+            List.of("refName", "id", "version", "references", "auditInfo", "persistentEvents");
+
+    /**
+     * The constraint annotations that mark a field as required. Only the
+     * {@code jakarta.validation.constraints} variants are listed: they are retained at runtime and
+     * are therefore visible to reflection, whereas the {@code org.jetbrains.annotations}
+     * equivalents are retained only at {@code CLASS} level and always read back as absent.
+     */
+    private static final List<Class<? extends java.lang.annotation.Annotation>> REQUIRED_FIELD_CONSTRAINTS = List.of(
+            jakarta.validation.constraints.NotNull.class,
+            jakarta.validation.constraints.NotBlank.class,
+            NotEmpty.class);
+
+    /**
+     * Reports whether a field is declared as required and so may not be cleared by an update.
+     *
+     * @param field the reflected field being updated
+     * @return true when a null value must be rejected for this field
+     */
+    private static boolean isRequiredField(@NotNull Field field) {
+        return REQUIRED_FIELD_CONSTRAINTS.stream().anyMatch(annotation -> field.getAnnotation(annotation) != null);
+    }
+
+    /**
+     * Applies the validation rules that are common to every pair-based update path: reserved
+     * fields, managed references, and ontology properties cannot be updated this way; a required
+     * field cannot be cleared; a value for an enum field must name one of that enum's constants;
+     * and a non-null value must be assignable to the field's declared type.
+     *
+     * <p>A {@code null} value is a request to clear the field and is valid for any field that is
+     * not required, including an enum field.
+     *
+     * @param field the reflected field being updated
+     * @param pair  the field/value pair supplied by the caller
+     * @throws NotSupportedException    if the field is a managed reference or an ontology property
+     * @throws IllegalArgumentException if the pair targets a reserved field, the value is null for
+     *                                  a required field, is not a valid constant of an enum field,
+     *                                  or is not assignable to the field's declared type
+     */
+    private void validateUpdatableField(@NotNull Field field, @NotNull Pair<String, Object> pair) {
+        if (RESERVED_UPDATE_FIELDS.contains(pair.getKey())) {
+            throw new IllegalArgumentException("Field:" + pair.getKey() + " is a reserved field and can't be updated");
+        }
+        if (field.getAnnotation(Reference.class) != null) {
+            Log.warn("Update to class that contains references");
+            throw new NotSupportedException("Field:" + field + " is a managed reference, and not updatable via put. Use Post");
+        }
+        if (hasOntologyPropertyAnnotation(field)) {
+            Log.warn("Update to class that contains ontology properties");
+            throw new NotSupportedException("Field:" + field + " is an ontology property, and not updatable via put. Use save() to update relationships");
+        }
+        if (pair.getValue() == null) {
+            if (isRequiredField(field)) {
+                throw new IllegalArgumentException("Field " + pair.getKey() + " is not nullable, but null value provided");
+            }
+            return;
+        }
+        if (field.getType().isEnum()) {
+            String value = pair.getValue().toString();
+            if (Arrays.stream(field.getType().getEnumConstants()).noneMatch(e -> e.toString().equals(value))) {
+                throw new IllegalArgumentException("Invalid value for enum field " + pair.getKey() + " can't set value:" + pair.getValue());
+            }
+        }
+        // Checked in addition to, not instead of, the enum-constant check above: a value whose
+        // toString() happens to match a constant's name (e.g. the String "HIGH") must still be
+        // rejected as the wrong type rather than accepted because the name matched.
+        if (!field.getType().isAssignableFrom(pair.getValue().getClass())) {
+            throw new IllegalArgumentException("Invalid value for field " + pair.getKey() +
+                    " can't set value:" + pair.getValue() +
+                    " expected type: " + field.getType() +
+                    " but got: " + pair.getValue().getClass().getSimpleName());
+        }
+    }
+
+    /**
+     * Shared implementation for the session-scoped pair updates, which differ only in whether the
+     * caller identifies the document by its string or {@link ObjectId} form.
+     *
+     * @param session the session to run the update in
+     * @param id      the {@code _id} value to match
+     * @param pairs   the field/value pairs to apply
+     * @return the number of documents modified
+     */
     @SafeVarargs
-    @Override
-    public final long update(MorphiaSession session, @NotNull String id, @NotNull Pair<String, Object>... pairs) {
+    private long updateInSession(MorphiaSession session, @NotNull Object id, @NotNull Pair<String, Object>... pairs) {
         List<UpdateOperator> updateOperators = new ArrayList<>();
         for (Pair<String, Object> pair : pairs) {
-            // check that the pair key corresponds to a field in the persistent class that is an enum
-            Field field = null;
             try {
-                field = getFieldFromHierarchy(getPersistentClass(),pair.getKey());
-                Reference ref = field.getAnnotation(Reference.class);
-                if (ref != null) {
-                    Log.warn("Update to class that contains references");
-                    throw new NotSupportedException("Field:" + field + " is a managed reference, and not updatable via put. Use Post");
-                }
-                if (hasOntologyPropertyAnnotation(field)) {
-                    Log.warn("Update to class that contains ontology properties");
-                    throw new NotSupportedException("Field:" + field + " is an ontology property, and not updatable via put. Use save() to update relationships");
-                }
-
-                if (field.getType().isEnum()) {
-                    // check that the pair value is a valid enum value of te field
-                    if (!Arrays.stream(field.getType().getEnumConstants()).anyMatch(e -> e.toString().equals(pair.getValue().toString()))) {
-                        throw new IllegalArgumentException("Invalid value for enum field " + pair.getKey() + " can't set value:" + pair.getValue());
-                    }
-
-                }
+                validateUpdatableField(getFieldFromHierarchy(getPersistentClass(), pair.getKey()), pair);
             } catch (NoSuchFieldException e) {
                 throw new RuntimeException(e);
             }
-            updateOperators.add(UpdateOperators.set(pair.getKey(), pair.getValue()));
+            updateOperators.add(buildUpdateOperator(pair.getKey(), pair.getValue()));
         }
         if (updateOperators.isEmpty()) {
             return 0;
@@ -1327,6 +1415,12 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
         return update.getModifiedCount();
     }
 
+    @SafeVarargs
+    @Override
+    public final long update(MorphiaSession session, @NotNull String id, @NotNull Pair<String, Object>... pairs) {
+        return updateInSession(session, id, pairs);
+    }
+
     @Override
     @SafeVarargs
     public final long update(Datastore datastore, @NotNull String id, @NotNull Pair<String, Object>... pairs) throws InvalidStateTransitionException {
@@ -1338,7 +1432,6 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
     @SafeVarargs
     public final long update(Datastore datastore, @NotNull ObjectId id, @NotNull Pair<String, Object>... pairs) throws InvalidStateTransitionException {
        List<UpdateOperator> updateOperators = new ArrayList<>();
-       List<String> reservedFields = List.of("refName", "id", "version", "references", "auditInfo", "persistentEvents");
 
        // Fetch the current entity to validate state transitions
        Optional<T> currentEntityOpt = findById(datastore, id);
@@ -1348,10 +1441,6 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
        T currentEntity = currentEntityOpt.get();
 
        for (Pair<String, Object> pair : pairs) {
-          if (reservedFields.contains(pair.getKey())) {
-             throw new IllegalArgumentException("Field:" + pair.getKey() + " is a reserved field and can't be updated");
-          }
-
           Field field;
           try {
              field = getFieldFromHierarchy(getPersistentClass(), pair.getKey());
@@ -1368,37 +1457,8 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
                 );
              }
 
-             // Existing validation checks
-             Reference ref = field.getAnnotation(Reference.class);
-             if (ref != null) {
-                throw new NotSupportedException("Field:" + field + " is a managed reference, and not updatable via put. Use Post");
-             }
-             if (hasOntologyPropertyAnnotation(field)) {
-                throw new NotSupportedException("Field:" + field + " is an ontology property, and not updatable via put. Use save() to update relationships");
-             }
-
-             if (field.getType().isEnum()) {
-                if (!Arrays.stream(field.getType().getEnumConstants())
-                        .anyMatch(e -> e.toString().equals(pair.getValue().toString()))) {
-                   throw new IllegalArgumentException(
-                      "Invalid value for enum field " + pair.getKey() + " can't set value:" + pair.getValue());
-                }
-             }
-
-             if (field.getAnnotation(NotNull.class) != null && pair.getValue() == null) {
-                throw new IllegalArgumentException(
-                   "Field " + pair.getKey() + " is not nullable, but null value provided");
-             }
-
-             if (!field.getType().isAssignableFrom(pair.getValue().getClass())) {
-                throw new IllegalArgumentException(
-                   "Invalid value for field " + pair.getKey() +
-                      " can't set value:" + pair.getValue() +
-                      " expected type: " + field.getType().toString() +
-                      " but got: " + pair.getValue().getClass().getSimpleName());
-             }
-
-             updateOperators.add(UpdateOperators.set(pair.getKey(), pair.getValue()));
+             validateUpdatableField(field, pair);
+             updateOperators.add(buildUpdateOperator(pair.getKey(), pair.getValue()));
           } catch (NoSuchFieldException | IllegalAccessException e) {
              throw new RuntimeException(e);
           }
@@ -1433,47 +1493,7 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
    @Override
    @SafeVarargs
     public final long update(MorphiaSession session, @NotNull ObjectId id, @NotNull Pair<String, Object>... pairs) {
-        List<UpdateOperator> updateOperators = new ArrayList<>();
-        for (Pair<String, Object> pair : pairs) {
-            // check that the pair key corresponds to a field in the persistent class that is an enum
-            Field field = null;
-            try {
-                field = getFieldFromHierarchy(getPersistentClass(),pair.getKey());
-                Reference ref = field.getAnnotation(Reference.class);
-                if (ref != null) {
-                    throw new NotSupportedException("Field:" + field + " is a managed reference, and not updatable via put. Use Post");
-                }
-                if (hasOntologyPropertyAnnotation(field)) {
-                    throw new NotSupportedException("Field:" + field + " is an ontology property, and not updatable via put. Use save() to update relationships");
-                }
-
-                if (field.getType().isEnum()) {
-                    // check that the pair value is a valid enum value of te field
-                    if (!Arrays.stream(field.getType().getEnumConstants()).anyMatch(e -> e.toString().equals(pair.getValue().toString()))) {
-                        throw new IllegalArgumentException("Invalid value for enum field " + pair.getKey() + " can't set value:" + pair.getValue());
-                    }
-
-                }
-            } catch (NoSuchFieldException e) {
-                throw new RuntimeException(e);
-            }
-            updateOperators.add(UpdateOperators.set(pair.getKey(), pair.getValue()));
-        }
-        if (updateOperators.isEmpty()) {
-            return 0;
-        }
-
-        UpdateResult update;
-        if (updateOperators.size() == 1) {
-            update = session.find(getPersistentClass()).filter(Filters.eq("_id", id))
-                    .update(updateOperators.get(0));
-        } else {
-            UpdateOperator[] ops = updateOperators.toArray(new UpdateOperator[0]);
-            update = session.find(getPersistentClass()).filter(Filters.eq("_id", id))
-                    .update(ops[0], Arrays.copyOfRange(ops, 1, ops.length));
-        }
-
-        return update.getModifiedCount();
+        return updateInSession(session, id, pairs);
     }
 
     // --- Bulk update implementations ---
@@ -1628,41 +1648,31 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
         return res.getModifiedCount();
     }
 
+   /**
+    * Validates the supplied field/value pairs for the bulk update paths and turns them into update
+    * operators. Reserved fields are rejected, and each value is checked against the declared type
+    * of the field it targets.
+    *
+    * <p>A {@code null} value clears the field it targets, provided that field is not required. This
+    * is how a caller resets an optional field, such as clearing a stale error code when a record
+    * later succeeds.
+    *
+    * @param pairs the field/value pairs to apply
+    * @return the operators to include in the update
+    * @throws NotSupportedException    if a pair targets a managed reference or an ontology property
+    * @throws IllegalArgumentException if a pair targets a reserved field, supplies a value of the
+    *                                  wrong type, or supplies null for a non-nullable field
+    */
    @SafeVarargs
     private  List<UpdateOperator> buildValidatedUpdateOperators(@NotNull Pair<String, Object>... pairs) {
         Objects.requireNonNull(pairs, "update pairs must not be null");
         List<UpdateOperator> updateOperators = new ArrayList<>();
-        List<String> reservedFields = List.of("refName", "id", "version", "references", "auditInfo", "persistentEvents");
         for (Pair<String, Object> pair : pairs) {
-            if (reservedFields.contains(pair.getKey())) {
-                throw new IllegalArgumentException("Field:" + pair.getKey() + " is a reserved field and can't be updated");
-            }
             Field field;
             try {
                 field = getFieldFromHierarchy(getPersistentClass(), pair.getKey());
-                Reference ref = field.getAnnotation(Reference.class);
-                if (ref != null) {
-                    throw new NotSupportedException("Field:" + field + " is a managed reference, and not updatable via put. Use Post");
-                }
-                if (hasOntologyPropertyAnnotation(field)) {
-                    throw new NotSupportedException("Field:" + field + " is an ontology property, and not updatable via put. Use save() to update relationships");
-                }
-                if (field.getType().isEnum()) {
-                    if (!Arrays.stream(field.getType().getEnumConstants())
-                            .anyMatch(e -> e.toString().equals(String.valueOf(pair.getValue())))) {
-                        throw new IllegalArgumentException("Invalid value for enum field " + pair.getKey() + " can't set value:" + pair.getValue());
-                    }
-                }
-                if (field.getAnnotation(NotNull.class) != null && pair.getValue() == null) {
-                    throw new IllegalArgumentException("Field " + pair.getKey() + " is not nullable, but null value provided");
-                }
-                if (pair.getValue() != null && !field.getType().isAssignableFrom(pair.getValue().getClass())) {
-                    throw new IllegalArgumentException("Invalid value for field " + pair.getKey() +
-                            " can't set value:" + pair.getValue() +
-                            " expected type: " + field.getType() +
-                            " but got: " + pair.getValue().getClass().getSimpleName());
-                }
-                updateOperators.add(UpdateOperators.set(pair.getKey(), pair.getValue()));
+                validateUpdatableField(field, pair);
+                updateOperators.add(buildUpdateOperator(pair.getKey(), pair.getValue()));
             } catch (NoSuchFieldException e) {
                 throw new RuntimeException(e);
             }
