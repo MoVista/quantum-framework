@@ -470,6 +470,10 @@ public class SecurityResource {
 
     private Response meForImpersonatedPrincipal(
             com.e2eq.framework.model.securityrules.PrincipalContext pc) {
+        // Defensive: SecurityContext.setPrincipalContext rejects a null/blank userId, and
+        // buildImpersonatedContext always copies userId from the target credential. This
+        // branch is not reachable through the impersonation filter path; kept so a future
+        // caller cannot fall through to the operator identity.
         String targetUserId = pc.getUserId();
         if (targetUserId == null || targetUserId.isBlank()) {
             RestError error = RestError.builder()

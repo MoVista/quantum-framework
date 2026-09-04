@@ -425,6 +425,10 @@ public class SecurityFilter implements ContainerRequestFilter, jakarta.ws.rs.con
         // Fast-path for constant allow/deny filters (common enableImpersonation("true") case).
         // Avoids spinning up a Graal context — with python-community on the classpath, engine
         // init alone can exceed the scripting memory budget and falsely deny impersonation.
+        // Known limitation: only exact "true"/"false" (trim + case-insensitive) are rescued.
+        // Non-constant impersonateFilterScript still initializes Graal and can hit the same
+        // memory-budget failure. Follow-up: raise quantum.security.scripting.maxMemoryBytes
+        // for the community runtime, or drop Python from the polyglot set so only JS loads.
         String trimmedScript = script.trim();
         if ("true".equalsIgnoreCase(trimmedScript)) {
             return true;

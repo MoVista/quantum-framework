@@ -229,7 +229,11 @@
       <version>${graalvm.version}</version>
       <type>pom</type>
     </dependency>
-    <!-- python support -->
+    <!-- python-community (GraalVM CE). SecurityFilter.runScript fast-path only rescues
+         constant true/false impersonation filters. Non-constant impersonateFilterScript
+         still initializes the Graal engine and can exceed quantum.security.scripting.maxMemoryBytes,
+         falsely denying impersonation. Follow-up: raise that budget for the community runtime,
+         or drop Python from the polyglot set so only the JS engine is initialized. -->
     <dependency>
       <groupId>org.graalvm.polyglot</groupId>
       <artifactId>python-community</artifactId>
