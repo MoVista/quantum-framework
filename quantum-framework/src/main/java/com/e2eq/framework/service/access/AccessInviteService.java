@@ -242,7 +242,9 @@ public class AccessInviteService {
             password,
             false,
             roles,
-            domainContext
+            domainContext,
+            null,
+            Boolean.TRUE
         );
 
         CredentialUserIdPassword credential = credentialRepo.findByUserId(userId, securityUtils.getSystemPrincipalContext().getDefaultRealm(), true)

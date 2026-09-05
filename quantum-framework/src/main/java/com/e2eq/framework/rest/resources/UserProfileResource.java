@@ -106,12 +106,16 @@ public class UserProfileResource extends BaseResource<UserProfile, UserProfileRe
 
          // create the credential
 
+         // Portal user create always builds a UserProfile after this call; stamp portal email routing
+         // explicitly (roles alone may be only "user" / "client" without portal-associate).
          authProviderFactory.getUserManager().createUser(
             createUserRequest.getUserId(),
             createUserRequest.getPassword(),
             createUserRequest.getForceChangePassword(),
             createUserRequest.getRoles(),
-            createUserRequest.getDomainContext());
+            createUserRequest.getDomainContext(),
+            null,
+            Boolean.TRUE);
 
          Optional<CredentialUserIdPassword> ocred = credentialRepo.findByUserId(createUserRequest.getUserId());
          if (!ocred.isPresent())
