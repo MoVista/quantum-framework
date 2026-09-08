@@ -577,14 +577,23 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
      * Opens a cursor of raw {@link BsonDocument}s for {@code query}/{@code findOptions},
      * bypassing Morphia's entity codec entirely so that a document which can't be mapped to
      * {@code T} doesn't prevent other documents in the same network batch from being read.
+     *
+     * <p>The find is issued through {@link MorphiaDatastore#operations()} rather than against the
+     * collection directly, which is how Morphia itself runs a typed query. That matters when
+     * {@code datastore} is a {@link dev.morphia.transactions.MorphiaSession}: its operations bind
+     * the caller's {@link com.mongodb.client.ClientSession} to the find, so the raw cursor reads
+     * inside the caller's transaction and sees the same snapshot (including its own uncommitted
+     * writes) as the typed path would. {@code configureCollection} likewise applies any
+     * collection/read settings carried on {@code findOptions}.
      */
     private MongoCursor<BsonDocument> openRawCursor(Datastore datastore, MorphiaQuery<T> query, FindOptions findOptions) {
         MorphiaDatastore morphiaDatastore = (MorphiaDatastore) datastore;
         Mapper mapper = morphiaDatastore.getMapper();
         String collectionName = mapper.getEntityModel(getPersistentClass()).collectionName();
-        MongoCollection<BsonDocument> rawCollection = morphiaDatastore.getDatabase()
-                .getCollection(collectionName, BsonDocument.class);
-        FindIterable<BsonDocument> rawIterable = findOptions.apply(rawCollection.find(query.toDocument()), mapper, getPersistentClass());
+        MongoCollection<BsonDocument> rawCollection = morphiaDatastore.configureCollection(findOptions,
+                morphiaDatastore.getDatabase().getCollection(collectionName, BsonDocument.class));
+        FindIterable<BsonDocument> rawIterable = findOptions.apply(
+                morphiaDatastore.operations().find(rawCollection, query.toDocument()), mapper, getPersistentClass());
         return rawIterable.iterator();
     }
 

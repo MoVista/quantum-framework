@@ -8,6 +8,7 @@ import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.model.Filters;
 import com.mongodb.client.model.Updates;
+import dev.morphia.transactions.MorphiaSession;
 import io.quarkus.test.junit.QuarkusTest;
 import jakarta.inject.Inject;
 import org.bson.Document;
@@ -114,6 +115,47 @@ public class MorphiaRepoSkipUnparseableIntegrationTest extends BaseRepoTest {
             assertTrue(refNames.contains(trio.valid1().getRefName()));
             assertTrue(refNames.contains(trio.valid2().getRefName()));
             assertFalse(refNames.contains(trio.bad().getRefName()));
+        }
+    }
+
+    /**
+     * The raw-BSON cursor used by the skip-unparseable machinery must run through the datastore it
+     * was handed rather than against the collection directly, so that a caller streaming inside a
+     * {@link MorphiaSession} transaction reads that transaction's snapshot. A document written but
+     * not yet committed in the session is visible to that session and to no one else, so streaming
+     * through the session is the cheapest way to observe whether the session was honored.
+     */
+    @Test
+    public void getStreamByQueryReadsWithinCallerSession() {
+        try (final SecuritySession ss = new SecuritySession(pContext, rContext)) {
+            String marker = "sessionScopedStreamTest-" + UUID.randomUUID();
+            String queryString = "refName:" + marker + "*";
+
+            try (MorphiaSession session = menuItemRepo.startSession(testUtils.getTestRealm())) {
+                session.startTransaction();
+                try {
+                    MenuItemModel uncommitted = new MenuItemModel();
+                    uncommitted.setRefName(marker + "-uncommitted");
+                    uncommitted = menuItemRepo.save(session, uncommitted);
+
+                    List<String> streamed = new ArrayList<>();
+                    try (CloseableIterator<MenuItemModel> iterator =
+                                 menuItemRepo.getStreamByQuery(session, 0, -1, queryString, null, null)) {
+                        while (iterator.hasNext()) {
+                            streamed.add(iterator.next().getRefName());
+                        }
+                    }
+
+                    assertEquals(List.of(uncommitted.getRefName()), streamed,
+                            "stream opened on a MorphiaSession should see that session's uncommitted write");
+                } finally {
+                    session.abortTransaction();
+                }
+            }
+
+            // The transaction was rolled back, so nothing should remain outside the session.
+            assertTrue(menuItemRepo.getListByQuery(0, 0, queryString).isEmpty(),
+                    "aborted transaction should have left no documents behind");
         }
     }
 
