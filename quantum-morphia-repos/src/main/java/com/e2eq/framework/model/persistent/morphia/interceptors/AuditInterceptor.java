@@ -1,8 +1,9 @@
 package com.e2eq.framework.model.persistent.morphia.interceptors;
 
 import com.e2eq.framework.model.persistent.base.AuditInfo;
-import com.e2eq.framework.model.persistent.base.BaseModel;
+import com.e2eq.framework.model.persistent.base.AuditInfoStamper;
 import com.e2eq.framework.model.persistent.base.UnversionedBaseModel;
+import com.e2eq.framework.model.securityrules.PrincipalContext;
 import com.e2eq.framework.model.securityrules.SecurityContext;
 import dev.morphia.Datastore;
 import dev.morphia.EntityListener;
@@ -18,52 +19,51 @@ public class AuditInterceptor implements EntityListener<Object> {
     @Override
     @PrePersist
     public void prePersist(Object ent, Document document, Datastore datastore) {
-        UnversionedBaseModel bm = null;
-        if (ent instanceof UnversionedBaseModel) {
-            bm = (UnversionedBaseModel) ent;
-
-            // Moved to the ValidationInterceptor to set the DataDomain.
-           /* if (SecurityContext.getPrincipalContext().isPresent()) {
-                if (bm.getDataDomain() == null) {
-                    DataDomain dd = SecurityContext.getPrincipalDataDomain().get();
-
-                    dd.setOrgRefName(SecurityContext.getPrincipalContext().get().getDataDomain().getOrgRefName());
-                    dd.setAccountNum(SecurityContext.getPrincipalContext().get().getDataDomain().getAccountNum());
-                    dd.setTenantId(SecurityContext.getPrincipalContext().get().getDataDomain().getTenantId());
-                    dd.setOwnerId(SecurityContext.getPrincipalContext().get().getUserId());
-                    dd.setDataSegment(SecurityContext.getPrincipalContext().get().getDataDomain().getDataSegment());
-                }
-            } */
-            if (bm.getAuditInfo() == null || bm.getAuditInfo().getCreationTs() == null) {
-                AuditInfo auditInfo = new AuditInfo();
-                auditInfo.setCreationTs(new Date());
-                auditInfo.setCreationIdentity(SecurityContext.getPrincipalContext().isPresent() ? SecurityContext.getPrincipalContext().get().getUserId() : "ANONYMOUS");
-                if (SecurityContext.getPrincipalContext().isPresent() &&
-                       (SecurityContext.getPrincipalContext().get().getImpersonatedBySubject() != null ||
-                        SecurityContext.getPrincipalContext().get().getImpersonatedByUserId() != null)) {
-                    auditInfo.setImpersonatorSubject(SecurityContext.getPrincipalContext().get().getImpersonatedBySubject() );
-                    auditInfo.setImpersonatorUserId(SecurityContext.getPrincipalContext().get().getImpersonatedByUserId());
-                    auditInfo.setActingOnBehalfOfUserId(SecurityContext.getPrincipalContext().get().getActingOnBehalfOfUserId());
-                    auditInfo.setActingOnBehalfOfSubject(SecurityContext.getPrincipalContext().get().getActingOnBehalfOfSubject());
-                }
-                bm.setAuditInfo(auditInfo);
-            } else {
-                bm.getAuditInfo().setLastUpdateTs(new Date());
-                bm.getAuditInfo().setLastUpdateIdentity(SecurityContext.getPrincipalContext().isPresent() ? SecurityContext.getPrincipalContext().get().getUserId() : "ANONYMOUS");
-                if (SecurityContext.getPrincipalContext().isPresent() &&
-                       (SecurityContext.getPrincipalContext().get().getImpersonatedBySubject() != null ||
-                           SecurityContext.getPrincipalContext().get().getImpersonatedByUserId() != null)) {
-                    bm.getAuditInfo().setImpersonatorSubject(SecurityContext.getPrincipalContext().get().getImpersonatedBySubject() );
-                    bm.getAuditInfo().setImpersonatorUserId(SecurityContext.getPrincipalContext().get().getImpersonatedByUserId());
-                    bm.getAuditInfo().setActingOnBehalfOfUserId(SecurityContext.getPrincipalContext().get().getActingOnBehalfOfUserId());
-                    bm.getAuditInfo().setActingOnBehalfOfSubject(SecurityContext.getPrincipalContext().get().getActingOnBehalfOfSubject());
-                };
-
-            }
-
-
+        if (!(ent instanceof UnversionedBaseModel bm)) {
+            return;
         }
 
+        // DataDomain is set in ValidationInterceptor.
+        boolean creating = bm.getAuditInfo() == null || bm.getAuditInfo().getCreationTs() == null;
+        AuditInfo auditInfo = bm.getAuditInfo() == null ? new AuditInfo() : bm.getAuditInfo();
+        PrincipalContext ctx = SecurityContext.getPrincipalContext().orElse(null);
+        AuditInfoStamper.stamp(auditInfo, ctx, creating, new Date());
+        bm.setAuditInfo(auditInfo);
+        writeAuditInfoToDocument(document, auditInfo);
+    }
+
+    /**
+     * Morphia builds the BSON document before {@code prePersist}. Nulls on the entity are omitted
+     * from a re-encode, which would leave previously persisted impersonator fields in place, so
+     * nested keys that are now null are removed from the document explicitly.
+     */
+    static void writeAuditInfoToDocument(Document document, AuditInfo auditInfo) {
+        if (document == null || auditInfo == null) {
+            return;
+        }
+        Document auditDoc = document.get("auditInfo", Document.class);
+        if (auditDoc == null) {
+            auditDoc = new Document();
+            document.put("auditInfo", auditDoc);
+        }
+        putOrRemove(auditDoc, "creationTs", auditInfo.getCreationTs());
+        putOrRemove(auditDoc, "creationIdentity", auditInfo.getCreationIdentity());
+        putOrRemove(auditDoc, "lastUpdateTs", auditInfo.getLastUpdateTs());
+        putOrRemove(auditDoc, "lastUpdateIdentity", auditInfo.getLastUpdateIdentity());
+        putOrRemove(auditDoc, "impersonatorSubject", auditInfo.getImpersonatorSubject());
+        putOrRemove(auditDoc, "impersonatorUserId", auditInfo.getImpersonatorUserId());
+        putOrRemove(auditDoc, "lastImpersonatedByUserId", auditInfo.getLastImpersonatedByUserId());
+        putOrRemove(auditDoc, "lastImpersonatedAt", auditInfo.getLastImpersonatedAt());
+        putOrRemove(auditDoc, "actingOnBehalfOfSubject", auditInfo.getActingOnBehalfOfSubject());
+        putOrRemove(auditDoc, "actingOnBehalfOfUserId", auditInfo.getActingOnBehalfOfUserId());
+    }
+
+    private static void putOrRemove(Document doc, String key, Object value) {
+        if (value == null) {
+            doc.remove(key);
+        } else {
+            doc.put(key, value);
+        }
     }
 
     @Override
