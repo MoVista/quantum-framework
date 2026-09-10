@@ -3,6 +3,8 @@ package com.e2eq.framework.model.validators;
 import com.e2eq.framework.annotations.ValidMailingAddress;
 import com.e2eq.framework.model.persistent.base.MailingAddress;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.inject.Instance;
+import jakarta.inject.Inject;
 import jakarta.validation.ConstraintValidator;
 import jakarta.validation.ConstraintValidatorContext;
 import org.apache.commons.lang3.StringUtils;
@@ -32,6 +34,37 @@ public class MailingAddressValidator implements ConstraintValidator<ValidMailing
 
     protected static final Set<String> US_STATES_SET = new HashSet<>(Arrays.asList(US_STATES));
 
+    Set<String> additionalUsStateCodes = Set.of();
+
+    @Inject
+    void setMailingAddressValidationExtensions(Instance<MailingAddressValidationExtension> extensions) {
+        if (extensions == null || extensions.isUnsatisfied()) {
+            return;
+        }
+        Set<String> codes = new HashSet<>();
+        for (MailingAddressValidationExtension extension : extensions) {
+            Set<String> extra = extension.additionalUsStateCodes();
+            if (extra == null) {
+                continue;
+            }
+            for (String code : extra) {
+                if (code != null && US_STATE_PATTERN.matcher(code).matches()) {
+                    codes.add(code);
+                }
+            }
+        }
+        additionalUsStateCodes = Set.copyOf(codes);
+    }
+
+    boolean isValidUsStateCode(String code) {
+        if (code == null) {
+            return false;
+        }
+        if (US_STATES_SET.contains(code)) {
+            return true;
+        }
+        return US_STATE_PATTERN.matcher(code).matches() && additionalUsStateCodes.contains(code);
+    }
 
     @Override
     public boolean isValid(MailingAddress address, ConstraintValidatorContext constraintValidatorContext) {
@@ -110,7 +143,7 @@ public class MailingAddressValidator implements ConstraintValidator<ValidMailing
                     violationMessages.add(violationMessage);
                     rc = false;
                 }
-                if (address.getStateTwoLetterCode() != null && !US_STATES_SET.contains(address.getStateTwoLetterCode())) {
+                if (address.getStateTwoLetterCode() != null && !isValidUsStateCode(address.getStateTwoLetterCode())) {
                     violationMessage = "State two letter code is not a valid US state:  value:" + address.getStateTwoLetterCode();
                     constraintValidatorContext.buildConstraintViolationWithTemplate(violationMessage)
                             .addPropertyNode("state").addConstraintViolation();
