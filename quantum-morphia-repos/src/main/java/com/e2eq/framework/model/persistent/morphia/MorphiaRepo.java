@@ -1298,6 +1298,37 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
     }
 
     /**
+     * Stamps last-update plus current-write impersonation / acting-on-behalf-of fields.
+     * Impersonator fields are {@code $unset} when the caller is not impersonating so a
+     * pair-update does not leave a stale stamp. {@code lastImpersonated*} is {@code $set}
+     * only while impersonating and is never cleared here.
+     */
+    protected void addAuditInfoUpdateOperators(List<UpdateOperator> ops, String lastUpdateIdentity) {
+        Date now = new Date();
+        ops.add(UpdateOperators.set("auditInfo.lastUpdateTs", now));
+        ops.add(UpdateOperators.set("auditInfo.lastUpdateIdentity", lastUpdateIdentity));
+        PrincipalContext ctx = SecurityContext.getPrincipalContext().orElse(null);
+        if (AuditInfoStamper.isImpersonating(ctx)) {
+            ops.add(buildUpdateOperator("auditInfo.impersonatorSubject", ctx.getImpersonatedBySubject()));
+            ops.add(buildUpdateOperator("auditInfo.impersonatorUserId", ctx.getImpersonatedByUserId()));
+            if (ctx.getImpersonatedByUserId() != null) {
+                ops.add(UpdateOperators.set("auditInfo.lastImpersonatedByUserId", ctx.getImpersonatedByUserId()));
+            }
+            ops.add(UpdateOperators.set("auditInfo.lastImpersonatedAt", now));
+        } else {
+            ops.add(UpdateOperators.unset("auditInfo.impersonatorSubject"));
+            ops.add(UpdateOperators.unset("auditInfo.impersonatorUserId"));
+        }
+        if (AuditInfoStamper.isActingOnBehalfOf(ctx)) {
+            ops.add(buildUpdateOperator("auditInfo.actingOnBehalfOfSubject", ctx.getActingOnBehalfOfSubject()));
+            ops.add(buildUpdateOperator("auditInfo.actingOnBehalfOfUserId", ctx.getActingOnBehalfOfUserId()));
+        } else {
+            ops.add(UpdateOperators.unset("auditInfo.actingOnBehalfOfSubject"));
+            ops.add(UpdateOperators.unset("auditInfo.actingOnBehalfOfUserId"));
+        }
+    }
+
+    /**
      * Fields that every pair-based update path rejects outright, regardless of value: they are
      * either identity/concurrency metadata ({@code refName}, {@code id}, {@code version}),
      * maintained by the framework itself ({@code auditInfo}, {@code persistentEvents}), or a
@@ -1402,6 +1433,8 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
             return 0;
         }
 
+        addAuditInfoUpdateOperators(updateOperators, securityIdentity.getPrincipal().getName());
+
         UpdateResult update;
         if (updateOperators.size() == 1) {
             update = session.find(getPersistentClass()).filter(Filters.eq("_id", id))
@@ -1472,8 +1505,7 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
           updateOperators.add(UpdateOperators.inc("version", 1));
        }
 
-       updateOperators.add(UpdateOperators.set("auditInfo.lastUpdateTs", new Date()));
-       updateOperators.add(UpdateOperators.set("auditInfo.lastUpdateIdentity", securityIdentity.getPrincipal().getName()));
+       addAuditInfoUpdateOperators(updateOperators, securityIdentity.getPrincipal().getName());
 
        UpdateResult update;
        if (updateOperators.size() == 1) {
@@ -1533,8 +1565,7 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
         if (BaseModel.class.isAssignableFrom(getPersistentClass())) {
             ops.add(UpdateOperators.inc("version", 1));
         }
-        ops.add(UpdateOperators.set("auditInfo.lastUpdateTs", new Date()));
-        ops.add(UpdateOperators.set("auditInfo.lastUpdateIdentity", securityIdentity.getPrincipal().getName()));
+        addAuditInfoUpdateOperators(ops, securityIdentity.getPrincipal().getName());
 
         UpdateOperator[] arr = ops.toArray(new UpdateOperator[0]);
         UpdateResult res = datastore.find(getPersistentClass()).filter(qfilters)
@@ -1577,8 +1608,7 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
         if (BaseModel.class.isAssignableFrom(getPersistentClass())) {
             ops.add(UpdateOperators.inc("version", 1));
         }
-        ops.add(UpdateOperators.set("auditInfo.lastUpdateTs", new Date()));
-        ops.add(UpdateOperators.set("auditInfo.lastUpdateIdentity", securityIdentity.getPrincipal().getName()));
+        addAuditInfoUpdateOperators(ops, securityIdentity.getPrincipal().getName());
 
         UpdateOperator[] arr = ops.toArray(new UpdateOperator[0]);
         UpdateResult res = datastore.find(getPersistentClass()).filter(qfilters)
@@ -1639,8 +1669,7 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
         if (BaseModel.class.isAssignableFrom(getPersistentClass())) {
             ops.add(UpdateOperators.inc("version", 1));
         }
-        ops.add(UpdateOperators.set("auditInfo.lastUpdateTs", new Date()));
-        ops.add(UpdateOperators.set("auditInfo.lastUpdateIdentity", securityIdentity.getPrincipal().getName()));
+        addAuditInfoUpdateOperators(ops, securityIdentity.getPrincipal().getName());
 
         UpdateOperator[] arr = ops.toArray(new UpdateOperator[0]);
         UpdateResult res = datastore.find(getPersistentClass()).filter(qfilters)

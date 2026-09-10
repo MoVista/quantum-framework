@@ -141,4 +141,66 @@ public class SecureResourceTest {
         System.out.println("Response: " + response.asString());
         Assertions.assertEquals(200, response.getStatusCode());
     }
+
+    /**
+     * When X-Impersonate-UserId is active, GET /security/me must return the impersonated
+     * principal's userId and roles (not the operator JWT identity).
+     */
+    @Test
+    public void testMeReflectsImpersonatedPrincipal() throws ReferentialIntegrityViolationException {
+        String[] roles = {"admin", "user"};
+        PrincipalContext pContext = testUtils.getTestPrincipalContext(testUtils.getSystemUserId(), roles);
+        ResourceContext rContext = testUtils.getResourceContext(testUtils.getArea(), "userProfile", "update");
+        ruleContext.initDefaultRules("security", "userProfile", testUtils.getTestUserId());
+
+        String targetUserId = "testuser-me@end2endlogic.com";
+        String operatorUserId = "testadmin-me@end2endlogic.com";
+        AuthProvider.LoginResponse loginResponse;
+
+        try (final SecuritySession ss = new SecuritySession(pContext, rContext)) {
+            if (authFactory.getUserManager().userIdExists(targetUserId)) {
+                authFactory.getUserManager().removeUserWithUserId(targetUserId);
+            }
+            authFactory.getUserManager().createUser(targetUserId, "P@55w@rd", Set.of("user"), testUtils.getTestDomainContext());
+
+            if (authFactory.getUserManager().userIdExists(operatorUserId)) {
+                authFactory.getUserManager().removeUserWithUserId(operatorUserId);
+            }
+            authFactory.getUserManager().createUser(operatorUserId, "P@55w@rd", Set.of("admin"), testUtils.getTestDomainContext());
+            authFactory.getUserManager().enableImpersonationWithUserId(operatorUserId, "true", "*", testUtils.getSystemRealm());
+
+            loginResponse = authFactory.getAuthProvider().login(operatorUserId, "P@55w@rd");
+            Assertions.assertTrue(loginResponse.authenticated());
+        }
+
+        Response meAsOperator = given()
+                .header("Authorization", "Bearer " + loginResponse.positiveResponse().accessToken())
+                .header("X-Realm", testUtils.getTestRealm())
+                .when()
+                .get("/security/me")
+                .then()
+                .extract().response();
+        Assertions.assertEquals(200, meAsOperator.getStatusCode(), meAsOperator.asString());
+        Assertions.assertEquals(operatorUserId, meAsOperator.jsonPath().getString("userId"));
+
+        Response meImpersonating = given()
+                .header("Authorization", "Bearer " + loginResponse.positiveResponse().accessToken())
+                .header("X-Impersonate-UserId", targetUserId)
+                .header("X-Realm", testUtils.getTestRealm())
+                .when()
+                .get("/security/me")
+                .then()
+                .extract().response();
+
+        Assertions.assertEquals(200, meImpersonating.getStatusCode(), meImpersonating.asString());
+        Assertions.assertEquals(targetUserId, meImpersonating.jsonPath().getString("userId"),
+                "/security/me must return the impersonated userId");
+
+        java.util.List<String> meRoles = meImpersonating.jsonPath().getList("roles");
+        Assertions.assertNotNull(meRoles, "/security/me must include effective roles");
+        Assertions.assertTrue(meRoles.contains("user"),
+                "impersonated roles should include target credential role 'user': " + meRoles);
+        Assertions.assertFalse(meRoles.contains("admin"),
+                "impersonated roles must not include operator TOKEN role 'admin': " + meRoles);
+    }
 }
