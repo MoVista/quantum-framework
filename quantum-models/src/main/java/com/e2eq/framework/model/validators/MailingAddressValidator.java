@@ -34,7 +34,7 @@ public class MailingAddressValidator implements ConstraintValidator<ValidMailing
 
     protected static final Set<String> US_STATES_SET = new HashSet<>(Arrays.asList(US_STATES));
 
-    Set<String> additionalUsStateCodes = Set.of();
+    volatile Set<String> additionalUsStateCodes = Set.of();
 
     @Inject
     void setMailingAddressValidationExtensions(Instance<MailingAddressValidationExtension> extensions) {
