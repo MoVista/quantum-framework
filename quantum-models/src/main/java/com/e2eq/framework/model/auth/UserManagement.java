@@ -36,6 +36,17 @@ public interface UserManagement extends UserManagementBase{
     String createUser(String userId, String password, Boolean forceChangePassword,
                     Set<String> roles, DomainContext domainContext, DataDomain dataDomain) throws SecurityException;
 
+    /**
+     * Creates a user with an explicit portal-access intent for identity-provider attributes
+     * used by invite/forgot-password email routing (e.g. Cognito {@code custom:portalAccess}).
+     *
+     * @param portalAccess {@code true}/{@code false} forces the stamp; {@code null} falls back to
+     *        a role heuristic ({@code admin} / {@code system} / {@code portal-associate})
+     */
+    String createUser(String userId, String password, Boolean forceChangePassword,
+                    Set<String> roles, DomainContext domainContext, DataDomain dataDomain,
+                    Boolean portalAccess) throws SecurityException;
+
     Optional<String> getSubjectForUserId(String userId) throws SecurityException;
     Optional<String> getUserIdForSubject(String subject) throws SecurityException;
 

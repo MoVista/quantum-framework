@@ -20,8 +20,26 @@ public class AuditInfo {
    protected String creationIdentity;
    protected Date lastUpdateTs;
    protected String lastUpdateIdentity;
+   /**
+    * Operator on the current write when that write was impersonated. Cleared on a later
+    * non-impersonated save so it stays aligned with {@link #lastUpdateIdentity}.
+    */
    protected String impersonatorSubject;
+   /**
+    * Operator on the current write when that write was impersonated. Cleared on a later
+    * non-impersonated save so it stays aligned with {@link #lastUpdateIdentity}.
+    */
    protected String impersonatorUserId;
+   /**
+    * Operator who last wrote this record while impersonating. Sticky: set on an impersonated
+    * create/update and never cleared by a later non-impersonated write. There is no event log
+    * of every impersonated touch; this is the surviving hint.
+    */
+   protected String lastImpersonatedByUserId;
+   /**
+    * When {@link #lastImpersonatedByUserId} was last stamped.
+    */
+   protected Date lastImpersonatedAt;
    protected String actingOnBehalfOfSubject;
    protected String actingOnBehalfOfUserId;
 

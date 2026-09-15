@@ -45,7 +45,7 @@
   </developers>
   <properties>
     <maven.compiler.release>17</maven.compiler.release>
-    <graalvm.version>24.1.0</graalvm.version>
+    <graalvm.version>24.1.2</graalvm.version>
     <quarkus-amazon-services.version>2.18.1</quarkus-amazon-services.version>
     <maven.build.timestamp.format
         >yyyy-MM-dd'T'HH:mm:ss'Z'</maven.build.timestamp.format>
@@ -204,7 +204,7 @@
     <!-- python support -->
     <dependency>
       <groupId>org.graalvm.polyglot</groupId>
-      <artifactId>python</artifactId>
+      <artifactId>python-community</artifactId>
       <version>${graalvm.version}</version>
       <type>pom</type>
     </dependency>

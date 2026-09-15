@@ -202,7 +202,8 @@ public class UserProfileRepo extends MorphiaRepo<UserProfile> {
          // this will handle the password encryption and storage in the system
          // and will also handle the creation of the user in the authentication system
          // (like LDAP, Active Directory, etc.)
-         authProviderFactory.getUserManager().createUser( userId, password, forceChangePassword, roleSet, domainContext, dataDomain);
+         authProviderFactory.getUserManager().createUser(
+            userId, password, forceChangePassword, roleSet, domainContext, dataDomain, Boolean.TRUE);
       } else {
         Log.warnf("User  with userId %s already exists in the auth provider. skipping create", userId);
       }
