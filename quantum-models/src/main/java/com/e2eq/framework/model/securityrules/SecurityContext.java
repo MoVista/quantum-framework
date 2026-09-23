@@ -92,10 +92,12 @@ public class SecurityContext {
    /**
     * Clears all per-thread security state for this request/episode.
     *
-    * <p>Resets principal context, resource context, and ignore-rules depth.
-    * Request teardown (the REST response filter) calls this so a leaked
-    * {@link #enterIgnoreRulesMode()} cannot survive on a pooled worker thread
-    * and silently bypass filters on later requests.</p>
+    * <p>Resets principal context, resource context, their push/pop stacks,
+    * and ignore-rules depth. Request teardown (the REST response filter)
+    * calls this so a leaked {@link #enterIgnoreRulesMode()} or
+    * {@link #pushPrincipalContext}/{@link #pushResourceContext} cannot
+    * survive on a pooled worker thread and restore stale identity on later
+    * requests.</p>
     *
     * <p>Logs a warning when ignore-rules depth is non-zero at teardown — that
     * means a caller entered ignore-rules without a matching
@@ -108,6 +110,8 @@ public class SecurityContext {
                ignoreRulesDepth);
       }
       tlIgnoreRulesDepth.remove();
+      tlPrincipalContextStack.remove();
+      tlResourceContextStack.remove();
       clearResourceContext();
       clearPrincipalContext();
    }
