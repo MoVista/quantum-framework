@@ -253,9 +253,9 @@ public final class SecurityCallScope {
    * </ul>
    *
    * <p><b>How it works:</b> While in this scope, {@link SecurityContext#isIgnoringRules()}
-   * returns true. Repository query methods (e.g., {@code getFilterArray()}) check this
-   * flag and skip rule evaluation when true. This is a depth-counted mechanism that
-   * supports nesting.</p>
+   * returns true. Repository query methods check this flag in {@code buildSecuredFilters}
+   * (and {@code getFilterArray}) and skip rule evaluation when true. This is a depth-counted
+   * mechanism that supports nesting.</p>
    *
    * <p><b>Security Considerations:</b> This bypasses security rules, so use it only for
    * internal framework queries where the calling code is already properly authorized.
