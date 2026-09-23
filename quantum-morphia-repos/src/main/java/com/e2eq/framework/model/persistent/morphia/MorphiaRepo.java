@@ -193,6 +193,29 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
         return securityFilterBuilder().getFilterArray(filters, modelClass);
     }
 
+    /**
+     * Morphia 3 encodes {@code Query.filter(Filter...)} into a single document. Two {@code $in}
+     * clauses on the same field then nest {@code $and} under that field, which MongoDB rejects
+     * as {@code unknown operator: $and}. Collapse multiple filters into one top-level {@code $and}
+     * so each clause stays its own document.
+     */
+    static Filter[] combineForMorphiaQuery(Filter[] filters) {
+        if (filters == null || filters.length == 0) {
+            return new Filter[0];
+        }
+        if (filters.length == 1) {
+            return filters;
+        }
+        return new Filter[] {Filters.and(filters)};
+    }
+
+    static Filter[] combineForMorphiaQuery(List<Filter> filters) {
+        if (filters == null || filters.isEmpty()) {
+            return new Filter[0];
+        }
+        return combineForMorphiaQuery(filters.toArray(new Filter[0]));
+    }
+
     private RepoLifecycleHooks lifecycleHooks() {
         RepoLifecycleHooks hooks = cachedLifecycleHooks;
         if (hooks == null) {
@@ -288,7 +311,7 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
           qfilters = filters.toArray(qfilters);
        }
 
-        Query<T> query = datastore.find(getPersistentClass()).filter(qfilters);
+        Query<T> query = datastore.find(getPersistentClass()).filter(combineForMorphiaQuery(qfilters));
         T obj = query.first();
 
         if (obj != null) {
@@ -330,7 +353,7 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
           qfilters = filters.toArray(qfilters);
        }
 
-        Query<T> query = datastore.find(getPersistentClass()).filter(qfilters);
+        Query<T> query = datastore.find(getPersistentClass()).filter(combineForMorphiaQuery(qfilters));
         T obj = query.first();
 
         if (obj != null) {
@@ -403,9 +426,8 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
                 filters.add(Filters.and(filter));
             }
         }
-        Filter[] filterArray = new Filter[filters.size()];
         Query<T> entityRefQuery = datastore.find(getPersistentClass())
-                .filter(filters.toArray(filterArray));
+                .filter(combineForMorphiaQuery(filters));
 
         List<EntityReference> list = new ArrayList<>();
         String realmId = datastore.getDatabase().getName();
@@ -701,9 +723,8 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
             }
         }
 
-        Filter[] filterArray = new Filter[filters.size()];
         Query<T> streamQuery = datastore.find(getPersistentClass())
-                .filter(filters.toArray(filterArray));
+                .filter(combineForMorphiaQuery(filters));
 
         // Defensive: the public signature accepts any Datastore/Query, though
         // MorphiaDataStoreWrapper always hands back a MorphiaDatastore/MorphiaQuery pair.
@@ -829,9 +850,8 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
 
             }
         }
-        Filter[] filterArray = new Filter[filters.size()];
         Query<T> listQuery = datastore.find(getPersistentClass())
-                .filter(filters.toArray(filterArray));
+                .filter(combineForMorphiaQuery(filters));
 
         List<T> list = new ArrayList<>();
         String realm = datastore.getDatabase().getName();
@@ -888,7 +908,7 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
         Filter[] filterArray = getFilterArray(filters, getPersistentClass());
 
         Query<T> listQuery = datastore.find(getPersistentClass())
-                .filter(filterArray);
+                .filter(combineForMorphiaQuery(filterArray));
 
         List<T> list = new ArrayList<>();
         String realm = datastore.getDatabase().getName();
@@ -925,9 +945,8 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
 
         FindOptions findOptions = new FindOptions();
 
-        Filter[] filterArray = new Filter[filters.size()];
         Query<T> query = datastore.find(getPersistentClass())
-                .filter(filters.toArray(filterArray));
+                .filter(combineForMorphiaQuery(filters));
 
         List<T> list = toListSkippingUnparseable(datastore, query, findOptions);
 
@@ -961,9 +980,8 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
 
         FindOptions findOptions = new FindOptions();
 
-        Filter[] filterArray = new Filter[filters.size()];
         Query<T> query = datastore.find(getPersistentClass())
-                .filter(filters.toArray(filterArray));
+                .filter(combineForMorphiaQuery(filters));
 
         List<T> list = toListSkippingUnparseable(datastore, query, findOptions);
 
@@ -1001,9 +1019,8 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
                 filters.add(Filters.and(filter));
             }
         }
-        Filter[] filterArray = new Filter[filters.size()];
         long count = datastore.find(getPersistentClass())
-                .filter(filters.toArray(filterArray))
+                .filter(combineForMorphiaQuery(filters))
                 .count();
         return count;
     }
@@ -1760,7 +1777,7 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
         addAuditInfoUpdateOperators(ops, securityIdentity.getPrincipal().getName());
 
         UpdateOperator[] arr = ops.toArray(new UpdateOperator[0]);
-        UpdateResult res = datastore.find(getPersistentClass()).filter(qfilters)
+        UpdateResult res = datastore.find(getPersistentClass()).filter(combineForMorphiaQuery(qfilters))
                 .update(new UpdateOptions().multi(true), arr[0], Arrays.copyOfRange(arr, 1, arr.length));
         return res.getModifiedCount();
     }
@@ -1803,7 +1820,7 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
         addAuditInfoUpdateOperators(ops, securityIdentity.getPrincipal().getName());
 
         UpdateOperator[] arr = ops.toArray(new UpdateOperator[0]);
-        UpdateResult res = datastore.find(getPersistentClass()).filter(qfilters)
+        UpdateResult res = datastore.find(getPersistentClass()).filter(combineForMorphiaQuery(qfilters))
                 .update(new UpdateOptions().multi(true), arr[0], Arrays.copyOfRange(arr, 1, arr.length));
         return res.getModifiedCount();
     }
@@ -1864,7 +1881,7 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
         addAuditInfoUpdateOperators(ops, securityIdentity.getPrincipal().getName());
 
         UpdateOperator[] arr = ops.toArray(new UpdateOperator[0]);
-        UpdateResult res = datastore.find(getPersistentClass()).filter(qfilters)
+        UpdateResult res = datastore.find(getPersistentClass()).filter(combineForMorphiaQuery(qfilters))
                 .update(new UpdateOptions().multi(true), arr[0], Arrays.copyOfRange(arr, 1, arr.length));
         return res.getModifiedCount();
     }
