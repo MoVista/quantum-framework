@@ -422,6 +422,21 @@ public class SecurityFilter implements ContainerRequestFilter, jakarta.ws.rs.con
 
         Log.debugf("Running impersonation filter script for user:%s, userId:%s, realm:%s", subject, userId, realm);
 
+        // Fast-path for constant allow/deny filters (common enableImpersonation("true") case).
+        // Avoids spinning up a Graal context — with python-community on the classpath, engine
+        // init alone can exceed the scripting memory budget and falsely deny impersonation.
+        // Known limitation: only exact "true"/"false" (trim + case-insensitive) are rescued.
+        // Non-constant impersonateFilterScript still initializes Graal and can hit the same
+        // memory-budget failure. Follow-up: raise quantum.security.scripting.maxMemoryBytes
+        // for the community runtime, or drop Python from the polyglot set so only JS loads.
+        String trimmedScript = script.trim();
+        if ("true".equalsIgnoreCase(trimmedScript)) {
+            return true;
+        }
+        if ("false".equalsIgnoreCase(trimmedScript)) {
+            return false;
+        }
+
         // Resolve scripting config with runtime fallback (when not CDI-injected)
         boolean enabled = scriptingEnabled;
         boolean allowAll = scriptingAllowAllAccess;
@@ -998,9 +1013,11 @@ public class SecurityFilter implements ContainerRequestFilter, jakarta.ws.rs.con
 
     private PrincipalContext buildImpersonatedContext(CredentialUserIdPassword targetCreds, CredentialUserIdPassword originalCreds,
                                                      String actingOnBehalfOfSubject, String actingOnBehalfOfUserId) {
-        // Use the target credential's realm for UserProfile/UserGroup lookups during impersonation
+        // Use the target credential's realm for UserProfile/UserGroup lookups during impersonation.
+        // Pass null SecurityIdentity so the operator's JWT/TOKEN roles are not unioned into the
+        // target principal (IdentityRoleResolver always adds TOKEN roles when identity is present).
         String targetRealm = targetCreds.getDomainContext().getDefaultRealm();
-        String[] roles = resolveEffectiveRoles(securityIdentity, targetCreds, targetRealm);
+        String[] roles = resolveEffectiveRoles(null, targetCreds, targetRealm);
         DataDomain dataDomain = targetCreds.getDomainContext().toDataDomain(targetCreds.getUserId());
 
         return new PrincipalContext.Builder()

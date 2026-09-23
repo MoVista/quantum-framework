@@ -39,8 +39,16 @@ import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotEmpty;
 import jakarta.ws.rs.NotSupportedException;
 import jakarta.ws.rs.PathParam;
+import com.mongodb.client.FindIterable;
+import com.mongodb.client.MongoCollection;
+import com.mongodb.client.MongoCursor;
 import org.apache.commons.lang3.NotImplementedException;
 import org.apache.commons.lang3.tuple.Pair;
+import org.bson.BsonDocument;
+import org.bson.BsonDocumentReader;
+import org.bson.codecs.Codec;
+import org.bson.codecs.DecoderContext;
+import org.bson.codecs.configuration.CodecConfigurationException;
 import org.bson.types.ObjectId;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jetbrains.annotations.NotNull;
@@ -49,6 +57,7 @@ import jakarta.enterprise.inject.Instance;
 
 import java.lang.reflect.Field;
 import java.util.*;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
 import static dev.morphia.query.Sort.ascending;
@@ -88,6 +97,17 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
 
     private volatile Collation cachedSortCollation;
     private volatile boolean sortCollationResolved;
+
+    // Safety valve for the skip-unparseable-document fallback (see the note above
+    // isUnparseableDocumentException): isUnparseableDocumentException matches any
+    // IllegalArgumentException in a decode failure's cause chain, which is intentionally broad
+    // so that unanticipated codec failures are still tolerated. If an unrelated bug were to make
+    // every document in a collection "unparseable", that broad match would otherwise silently
+    // return an empty (or heavily truncated) list/stream instead of surfacing the problem. Once
+    // more than this many documents are skipped within a single fetch, skip-unparseable aborts
+    // and rethrows the last decode failure instead of continuing.
+    @ConfigProperty(name = "quantum.morphia.maxSkippedUnparseableDocuments", defaultValue = "1000")
+    protected int maxSkippedUnparseableDocuments;
 
     private void callPostPersistHooks(String realmId, Object entity) {
         lifecycleHooks().callPostPersistHooks(realmId, entity);
@@ -392,7 +412,6 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
         List<Filter> filters = new ArrayList<>();
         filters = securityFilterBuilder().buildSecuredFilters(filters, getPersistentClass());
 
-        MorphiaCursor<T> cursor;
         List<ProjectionField> projectionFields = new ArrayList<>();
         projectionFields.add(new ProjectionField( "refName", ProjectionField.ProjectionType.INCLUDE));
         projectionFields.add(new ProjectionField( "id", ProjectionField.ProjectionType.INCLUDE));
@@ -406,26 +425,18 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
                 Filter filter = MorphiaUtils.convertToFilter(query, getPersistentClass());
                 filters.add(Filters.and(filter));
             }
-            cursor = datastore.find(getPersistentClass())
-                    .filter(combineForMorphiaQuery(filters))
-                    .iterator(findOptions);
-        } else {
-            cursor = datastore.find(getPersistentClass())
-                    .filter(combineForMorphiaQuery(filters))
-                    .iterator(findOptions);
         }
+        Query<T> entityRefQuery = datastore.find(getPersistentClass())
+                .filter(combineForMorphiaQuery(filters));
 
         List<EntityReference> list = new ArrayList<>();
         String realmId = datastore.getDatabase().getName();
-        try (cursor) {
-            EntityReference entityReference;
-            for (T model : cursor.toList()) {
-                UIActionList uiActions = model.calculateStateBasedUIActions();
-                model.setActionList(uiActions);
-                model.setModelSourceRealm(realmId);
-                entityReference = model.createEntityReference();
-                list.add(entityReference);
-            }
+        for (T model : toListSkippingUnparseable(datastore, entityRefQuery, findOptions)) {
+            UIActionList uiActions = model.calculateStateBasedUIActions();
+            model.setActionList(uiActions);
+            model.setModelSourceRealm(realmId);
+            EntityReference entityReference = model.createEntityReference();
+            list.add(entityReference);
         }
 
         return list;
@@ -551,6 +562,148 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
         }
     }
 
+    // -- Skip-unparseable-document support -------------------------------------------------
+    //
+    // Morphia (via the Mongo driver) decodes an entire network batch of documents as a single
+    // unit -- both the initial `find` response and every later `getMore` response -- so
+    // wrapping a single `cursor.next()` call in a try/catch is not enough: one document that
+    // can't be mapped (e.g. it stores an enum value no longer present in the Java enum) fails
+    // decoding of the whole batch, including otherwise-valid sibling documents in that same
+    // batch. To recover, we re-run the same query but decode raw BSON one document at a time
+    // via the entity's codec so only the bad document(s) are skipped (and logged). This slow
+    // path is only ever taken *after* the normal, fast, natively-typed path has failed, so the
+    // happy path (no unparseable documents) costs nothing extra.
+
+    /**
+     * True if {@code e} (or a cause in its chain) looks like a per-document mapping/decode
+     * failure -- e.g. {@code Enum.valueOf} rejecting a value stored in Mongo that no longer
+     * exists as a Java enum constant, or a codec refusing to decode a value -- as opposed to
+     * a broader infrastructure or programming error that should still fail the whole fetch.
+     */
+    protected static boolean isUnparseableDocumentException(RuntimeException e) {
+        Throwable t = e;
+        while (t != null) {
+            if (t instanceof IllegalArgumentException || t instanceof CodecConfigurationException) {
+                return true;
+            }
+            t = t.getCause();
+        }
+        return false;
+    }
+
+    private Codec<T> codecFor(Datastore datastore) {
+        return ((MorphiaDatastore) datastore).getCodecRegistry().get(getPersistentClass());
+    }
+
+    /**
+     * Opens a cursor of raw {@link BsonDocument}s for {@code query}/{@code findOptions},
+     * bypassing Morphia's entity codec entirely so that a document which can't be mapped to
+     * {@code T} doesn't prevent other documents in the same network batch from being read.
+     *
+     * <p>The find is issued through {@link MorphiaDatastore#operations()} rather than against the
+     * collection directly, which is how Morphia itself runs a typed query. That matters when
+     * {@code datastore} is a {@link dev.morphia.transactions.MorphiaSession}: its operations bind
+     * the caller's {@link com.mongodb.client.ClientSession} to the find, so the raw cursor reads
+     * inside the caller's transaction and sees the same snapshot (including its own uncommitted
+     * writes) as the typed path would. {@code configureCollection} likewise applies any
+     * collection/read settings carried on {@code findOptions}.
+     */
+    private MongoCursor<BsonDocument> openRawCursor(Datastore datastore, MorphiaQuery<T> query, FindOptions findOptions) {
+        MorphiaDatastore morphiaDatastore = (MorphiaDatastore) datastore;
+        Mapper mapper = morphiaDatastore.getMapper();
+        String collectionName = mapper.getEntityModel(getPersistentClass()).collectionName();
+        MongoCollection<BsonDocument> rawCollection = morphiaDatastore.configureCollection(findOptions,
+                morphiaDatastore.getDatabase().getCollection(collectionName, BsonDocument.class));
+        FindIterable<BsonDocument> rawIterable = findOptions.apply(
+                morphiaDatastore.operations().find(rawCollection, query.toDocument()), mapper, getPersistentClass());
+        return rawIterable.iterator();
+    }
+
+    /**
+     * Decodes {@code raw} into {@code T} using {@code codec}. If decoding fails with what looks
+     * like an unparseable document (see {@link #isUnparseableDocumentException}), logs a warning
+     * and returns {@link Optional#empty()} instead of throwing -- unless {@code skippedCount} has
+     * already reached {@link #maxSkippedUnparseableDocuments} for this fetch, in which case the
+     * decode failure is rethrown rather than skipped (see the field javadoc for why).
+     */
+    private Optional<T> decodeSkippingUnparseable(Codec<T> codec, BsonDocument raw, AtomicInteger skippedCount) {
+        try {
+            return Optional.of(codec.decode(new BsonDocumentReader(raw), DecoderContext.builder().build()));
+        } catch (RuntimeException e) {
+            if (!isUnparseableDocumentException(e)) {
+                throw e;
+            }
+            if (skippedCount.incrementAndGet() > maxSkippedUnparseableDocuments) {
+                throw new IllegalStateException(
+                        "Exceeded the limit of " + maxSkippedUnparseableDocuments
+                                + " unparseable documents skipped while fetching " + getPersistentClass().getSimpleName()
+                                + "; aborting instead of returning a heavily truncated result", e);
+            }
+            Log.warnf(e, "Skipping document (_id=%s) in collection for %s that could not be mapped: %s",
+                    raw.get("_id"), getPersistentClass().getSimpleName(), e.getMessage());
+            return Optional.empty();
+        }
+    }
+
+    /**
+     * Convenience overload using default {@link FindOptions} (no skip/limit/sort/projection).
+     */
+    protected List<T> toListSkippingUnparseable(Datastore datastore, Query<T> query) {
+        return toListSkippingUnparseable(datastore, query, new FindOptions());
+    }
+
+    /**
+     * Runs {@code query.iterator(findOptions).toList()} -- the normal, fast path. If decoding
+     * fails because a document could not be mapped to {@code T}, re-executes the same query
+     * decoding documents one at a time (see {@link #decodeSkippingUnparseable}) so only the
+     * unparseable document(s) are skipped -- and a warning logged -- instead of failing the
+     * whole fetch. Any other exception propagates and aborts the fetch as before.
+     */
+    protected List<T> toListSkippingUnparseable(Datastore datastore, Query<T> query, FindOptions findOptions) {
+        try {
+            try (MorphiaCursor<T> cursor = query.iterator(findOptions)) {
+                return cursor.toList();
+            }
+        } catch (RuntimeException e) {
+            if (!(datastore instanceof MorphiaDatastore) || !(query instanceof MorphiaQuery) || !isUnparseableDocumentException(e)) {
+                throw e;
+            }
+            Log.warnf("Batch decode failed while listing %s (%s); retrying with per-document decoding so unparseable documents can be skipped",
+                    getPersistentClass().getSimpleName(), e.getMessage());
+
+            @SuppressWarnings("unchecked")
+            MorphiaQuery<T> morphiaQuery = (MorphiaQuery<T>) query;
+            Codec<T> codec = codecFor(datastore);
+            List<T> list = new ArrayList<>();
+            AtomicInteger skippedCount = new AtomicInteger();
+            try (MongoCursor<BsonDocument> rawCursor = openRawCursor(datastore, morphiaQuery, findOptions)) {
+                while (rawCursor.hasNext()) {
+                    decodeSkippingUnparseable(codec, rawCursor.next(), skippedCount).ifPresent(list::add);
+                }
+            }
+            return list;
+        }
+    }
+
+    /**
+     * Streams query results, tolerating documents that can't be mapped to {@code T} (see the
+     * class-level note above {@link #isUnparseableDocumentException}).
+     *
+     * <p>Unlike {@link #toListSkippingUnparseable}, this can't try the fast typed path first and
+     * fall back on failure: by the time a batch decode fails, some documents from that batch may
+     * already have been handed to the caller, and re-running the query from a {@code skip}
+     * offset to "resume" is not safe -- a concurrent insert, delete, or update that shifts which
+     * documents fall before the resume point can cause the stream to duplicate or silently drop
+     * records. So instead, whenever the per-document skip-unparseable machinery is available, a
+     * single raw {@link BsonDocument} cursor is used for the entire stream, decoded one document
+     * at a time via the entity's codec; this is slightly slower than the batch-typed path but
+     * never needs to re-issue the query mid-stream.
+     *
+     * <p>As with {@link #toListSkippingUnparseable}, {@code limit} is applied server-side by
+     * Mongo, so an unparseable document within the limited window still counts against
+     * {@code limit} -- e.g. a stream with {@code limit=100} over a range containing one bad
+     * document yields 99 records.
+     */
     @Override
     public CloseableIterator<T> getStreamByQuery(Datastore datastore, int skip, int limit, @Nullable String query, @Nullable List<SortField> sortFields, @Nullable List<ProjectionField> projectionFields) {
         if (skip < 0) {
@@ -570,12 +723,74 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
             }
         }
 
-        MorphiaCursor<T> cursor = datastore.find(getPersistentClass())
-                .filter(combineForMorphiaQuery(filters))
-                .iterator(findOptions);
+        Query<T> streamQuery = datastore.find(getPersistentClass())
+                .filter(combineForMorphiaQuery(filters));
+
+        // Defensive: the public signature accepts any Datastore/Query, though
+        // MorphiaDataStoreWrapper always hands back a MorphiaDatastore/MorphiaQuery pair.
+        if (!(datastore instanceof MorphiaDatastore) || !(streamQuery instanceof MorphiaQuery)) {
+            return typedCursorIterator(streamQuery.iterator(findOptions));
+        }
+
+        @SuppressWarnings("unchecked")
+        MorphiaQuery<T> morphiaQuery = (MorphiaQuery<T>) streamQuery;
+        Codec<T> codec = codecFor(datastore);
+        MongoCursor<BsonDocument> rawCursor = openRawCursor(datastore, morphiaQuery, findOptions);
 
         return new CloseableIterator<>() {
             private static final int BATCH_SIZE = 1000; // Adjust this value as needed
+            private final List<T> batch = new ArrayList<>(BATCH_SIZE);
+            private int currentIndex = 0;
+            private final AtomicInteger skippedCount = new AtomicInteger();
+
+            @Override
+            public void close() {
+                rawCursor.close();
+            }
+
+            @Override
+            public boolean hasNext() {
+                if (currentIndex < batch.size()) {
+                    return true;
+                }
+                return fetchNextBatch();
+            }
+
+            @Override
+            public T next() {
+                if (currentIndex >= batch.size() && !fetchNextBatch()) {
+                    throw new NoSuchElementException();
+                }
+                T model = batch.get(currentIndex++);
+                processModel(model);
+                return model;
+            }
+
+            private boolean fetchNextBatch() {
+                batch.clear();
+                currentIndex = 0;
+                while (batch.size() < BATCH_SIZE && rawCursor.hasNext()) {
+                    decodeSkippingUnparseable(codec, rawCursor.next(), skippedCount).ifPresent(batch::add);
+                }
+                return !batch.isEmpty();
+            }
+
+            private void processModel(T model) {
+                UIActionList uiActions = model.calculateStateBasedUIActions();
+                model.setActionList(uiActions);
+            }
+        };
+    }
+
+    /**
+     * Wraps a plain {@link MorphiaCursor} in a {@link CloseableIterator}, batching reads the same
+     * way as the raw-cursor path above. Used only as a defensive fallback when the skip-unparseable
+     * machinery isn't applicable (non-{@link MorphiaDatastore}/{@link MorphiaQuery} inputs), in
+     * which case unparseable documents are not tolerated -- matching pre-existing behavior.
+     */
+    private CloseableIterator<T> typedCursorIterator(MorphiaCursor<T> cursor) {
+        return new CloseableIterator<>() {
+            private static final int BATCH_SIZE = 1000;
             private final List<T> batch = new ArrayList<>(BATCH_SIZE);
             private int currentIndex = 0;
 
@@ -595,27 +810,21 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
             @Override
             public T next() {
                 if (currentIndex >= batch.size() && !fetchNextBatch()) {
-                    return null;
+                    throw new NoSuchElementException();
                 }
                 T model = batch.get(currentIndex++);
-                processModel(model);
+                UIActionList uiActions = model.calculateStateBasedUIActions();
+                model.setActionList(uiActions);
                 return model;
             }
 
             private boolean fetchNextBatch() {
                 batch.clear();
                 currentIndex = 0;
-                for (int i = 0; i < BATCH_SIZE && cursor.hasNext(); i++) {
+                while (batch.size() < BATCH_SIZE && cursor.hasNext()) {
                     batch.add(cursor.next());
                 }
                 return !batch.isEmpty();
-            }
-
-            private void processModel(T model) {
-                if (model != null) {
-                    UIActionList uiActions = model.calculateStateBasedUIActions();
-                    model.setActionList(uiActions);
-                }
             }
         };
     }
@@ -630,9 +839,6 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
         List<Filter> filters = new ArrayList<>();
         filters = securityFilterBuilder().buildSecuredFilters(filters, getPersistentClass());
 
-
-        MorphiaCursor<T> cursor;
-
         FindOptions findOptions = buildFindOptions(skip, limit, sortFields, projectionFields);
 
         if (query != null && !query.isEmpty()) {
@@ -643,24 +849,17 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
                 Log.debugf("Running with filters:%s", filters.stream().map(Filter::toString).collect(Collectors.joining(",")));
 
             }
-            cursor = datastore.find(getPersistentClass())
-                    .filter(combineForMorphiaQuery(filters))
-                    .iterator(findOptions);
-        } else {
-            cursor = datastore.find(getPersistentClass())
-                    .filter(combineForMorphiaQuery(filters))
-                    .iterator(findOptions);
         }
+        Query<T> listQuery = datastore.find(getPersistentClass())
+                .filter(combineForMorphiaQuery(filters));
 
         List<T> list = new ArrayList<>();
         String realm = datastore.getDatabase().getName();
-        try (cursor) {
-            for (T model : cursor.toList()) {
-                UIActionList uiActions = model.calculateStateBasedUIActions();
-                model.setActionList(uiActions);
-                model.setModelSourceRealm(realm);
-                list.add(model);
-            }
+        for (T model : toListSkippingUnparseable(datastore, listQuery, findOptions)) {
+            UIActionList uiActions = model.calculateStateBasedUIActions();
+            model.setActionList(uiActions);
+            model.setModelSourceRealm(realm);
+            list.add(model);
         }
 
         return list;
@@ -708,22 +907,17 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
         // Add filters based upon rule and resourceContext;
         Filter[] filterArray = getFilterArray(filters, getPersistentClass());
 
-        MorphiaCursor<T> cursor;
-
-        cursor = datastore.find(getPersistentClass())
-                .filter(combineForMorphiaQuery(filterArray))
-                .iterator(findOptions);
+        Query<T> listQuery = datastore.find(getPersistentClass())
+                .filter(combineForMorphiaQuery(filterArray));
 
         List<T> list = new ArrayList<>();
         String realm = datastore.getDatabase().getName();
-        try (cursor) {
-            for (T model : cursor.toList()) {
-                UIActionList uiActions = model.calculateStateBasedUIActions();
-                model.setActionList(uiActions);
+        for (T model : toListSkippingUnparseable(datastore, listQuery, findOptions)) {
+            UIActionList uiActions = model.calculateStateBasedUIActions();
+            model.setActionList(uiActions);
 
-                model.setModelSourceRealm(realm);
-                list.add(model);
-            }
+            model.setModelSourceRealm(realm);
+            list.add(model);
         }
 
         return list;
@@ -751,10 +945,10 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
 
         FindOptions findOptions = new FindOptions();
 
-        Query<T> query = morphiaDataStoreWrapper.getDataStore(getSecurityContextRealmId()).find(getPersistentClass())
+        Query<T> query = datastore.find(getPersistentClass())
                 .filter(combineForMorphiaQuery(filters));
 
-        List<T> list = query.iterator(findOptions).toList();
+        List<T> list = toListSkippingUnparseable(datastore, query, findOptions);
 
         String realm = datastore.getDatabase().getName();
         for (T model : list) {
@@ -785,13 +979,13 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
         filters.add(Filters.in("refName", refNames));
 
         FindOptions findOptions = new FindOptions();
-       String realm= getSecurityContextRealmId();
 
-        Query<T> query = morphiaDataStoreWrapper.getDataStore(realm).find(getPersistentClass())
+        Query<T> query = datastore.find(getPersistentClass())
                 .filter(combineForMorphiaQuery(filters));
 
-        List<T> list = query.iterator(findOptions).toList();
+        List<T> list = toListSkippingUnparseable(datastore, query, findOptions);
 
+        String realm = datastore.getDatabase().getName();
         for (T model : list) {
             UIActionList uiActions = model.calculateStateBasedUIActions();
             model.setActionList(uiActions);
@@ -1294,40 +1488,161 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
         throw new NoSuchFieldException("Field '" + fieldName + "' not found in class hierarchy of " + clazz.getName());
     }
 
+    /**
+     * Builds the update operator for a single field/value pair.
+     *
+     * <p>A {@code null} value means "clear this field" and is translated to {@code $unset} rather
+     * than {@code $set: null}. That leaves the document in the same shape it would have if the
+     * entity had been persisted with the property unset, since Morphia does not store nulls by
+     * default, so reads are consistent regardless of which write path produced the document.
+     *
+     * @param fieldName the mapped field name to update
+     * @param value     the new value, or {@code null} to clear the field
+     * @return the operator that applies the requested change
+     */
+    private static UpdateOperator buildUpdateOperator(@NotNull String fieldName, Object value) {
+        return value == null
+                ? UpdateOperators.unset(fieldName)
+                : UpdateOperators.set(fieldName, value);
+    }
+
+    /**
+     * Stamps last-update plus current-write impersonation / acting-on-behalf-of fields.
+     * Impersonator fields are {@code $unset} when the caller is not impersonating so a
+     * pair-update does not leave a stale stamp. {@code lastImpersonated*} is {@code $set}
+     * only while impersonating and is never cleared here.
+     */
+    protected void addAuditInfoUpdateOperators(List<UpdateOperator> ops, String lastUpdateIdentity) {
+        Date now = new Date();
+        ops.add(UpdateOperators.set("auditInfo.lastUpdateTs", now));
+        ops.add(UpdateOperators.set("auditInfo.lastUpdateIdentity", lastUpdateIdentity));
+        PrincipalContext ctx = SecurityContext.getPrincipalContext().orElse(null);
+        if (AuditInfoStamper.isImpersonating(ctx)) {
+            ops.add(buildUpdateOperator("auditInfo.impersonatorSubject", ctx.getImpersonatedBySubject()));
+            ops.add(buildUpdateOperator("auditInfo.impersonatorUserId", ctx.getImpersonatedByUserId()));
+            if (ctx.getImpersonatedByUserId() != null) {
+                ops.add(UpdateOperators.set("auditInfo.lastImpersonatedByUserId", ctx.getImpersonatedByUserId()));
+            }
+            ops.add(UpdateOperators.set("auditInfo.lastImpersonatedAt", now));
+        } else {
+            ops.add(UpdateOperators.unset("auditInfo.impersonatorSubject"));
+            ops.add(UpdateOperators.unset("auditInfo.impersonatorUserId"));
+        }
+        if (AuditInfoStamper.isActingOnBehalfOf(ctx)) {
+            ops.add(buildUpdateOperator("auditInfo.actingOnBehalfOfSubject", ctx.getActingOnBehalfOfSubject()));
+            ops.add(buildUpdateOperator("auditInfo.actingOnBehalfOfUserId", ctx.getActingOnBehalfOfUserId()));
+        } else {
+            ops.add(UpdateOperators.unset("auditInfo.actingOnBehalfOfSubject"));
+            ops.add(UpdateOperators.unset("auditInfo.actingOnBehalfOfUserId"));
+        }
+    }
+
+    /**
+     * Fields that every pair-based update path rejects outright, regardless of value: they are
+     * either identity/concurrency metadata ({@code refName}, {@code id}, {@code version}),
+     * maintained by the framework itself ({@code auditInfo}, {@code persistentEvents}), or a
+     * managed relationship ({@code references}) that must go through {@code save()}.
+     */
+    private static final List<String> RESERVED_UPDATE_FIELDS =
+            List.of("refName", "id", "version", "references", "auditInfo", "persistentEvents");
+
+    /**
+     * The constraint annotations that mark a field as required. Only the
+     * {@code jakarta.validation.constraints} variants are listed: they are retained at runtime and
+     * are therefore visible to reflection, whereas the {@code org.jetbrains.annotations}
+     * equivalents are retained only at {@code CLASS} level and always read back as absent.
+     */
+    private static final List<Class<? extends java.lang.annotation.Annotation>> REQUIRED_FIELD_CONSTRAINTS = List.of(
+            jakarta.validation.constraints.NotNull.class,
+            jakarta.validation.constraints.NotBlank.class,
+            NotEmpty.class);
+
+    /**
+     * Reports whether a field is declared as required and so may not be cleared by an update.
+     *
+     * @param field the reflected field being updated
+     * @return true when a null value must be rejected for this field
+     */
+    private static boolean isRequiredField(@NotNull Field field) {
+        return REQUIRED_FIELD_CONSTRAINTS.stream().anyMatch(annotation -> field.getAnnotation(annotation) != null);
+    }
+
+    /**
+     * Applies the validation rules that are common to every pair-based update path: reserved
+     * fields, managed references, and ontology properties cannot be updated this way; a required
+     * field cannot be cleared; a value for an enum field must name one of that enum's constants;
+     * and a non-null value must be assignable to the field's declared type.
+     *
+     * <p>A {@code null} value is a request to clear the field and is valid for any field that is
+     * not required, including an enum field.
+     *
+     * @param field the reflected field being updated
+     * @param pair  the field/value pair supplied by the caller
+     * @throws NotSupportedException    if the field is a managed reference or an ontology property
+     * @throws IllegalArgumentException if the pair targets a reserved field, the value is null for
+     *                                  a required field, is not a valid constant of an enum field,
+     *                                  or is not assignable to the field's declared type
+     */
+    private void validateUpdatableField(@NotNull Field field, @NotNull Pair<String, Object> pair) {
+        if (RESERVED_UPDATE_FIELDS.contains(pair.getKey())) {
+            throw new IllegalArgumentException("Field:" + pair.getKey() + " is a reserved field and can't be updated");
+        }
+        if (field.getAnnotation(Reference.class) != null) {
+            Log.warn("Update to class that contains references");
+            throw new NotSupportedException("Field:" + field + " is a managed reference, and not updatable via put. Use Post");
+        }
+        if (hasOntologyPropertyAnnotation(field)) {
+            Log.warn("Update to class that contains ontology properties");
+            throw new NotSupportedException("Field:" + field + " is an ontology property, and not updatable via put. Use save() to update relationships");
+        }
+        if (pair.getValue() == null) {
+            if (isRequiredField(field)) {
+                throw new IllegalArgumentException("Field " + pair.getKey() + " is not nullable, but null value provided");
+            }
+            return;
+        }
+        if (field.getType().isEnum()) {
+            String value = pair.getValue().toString();
+            if (Arrays.stream(field.getType().getEnumConstants()).noneMatch(e -> e.toString().equals(value))) {
+                throw new IllegalArgumentException("Invalid value for enum field " + pair.getKey() + " can't set value:" + pair.getValue());
+            }
+        }
+        // Checked in addition to, not instead of, the enum-constant check above: a value whose
+        // toString() happens to match a constant's name (e.g. the String "HIGH") must still be
+        // rejected as the wrong type rather than accepted because the name matched.
+        if (!field.getType().isAssignableFrom(pair.getValue().getClass())) {
+            throw new IllegalArgumentException("Invalid value for field " + pair.getKey() +
+                    " can't set value:" + pair.getValue() +
+                    " expected type: " + field.getType() +
+                    " but got: " + pair.getValue().getClass().getSimpleName());
+        }
+    }
+
+    /**
+     * Shared implementation for the session-scoped pair updates, which differ only in whether the
+     * caller identifies the document by its string or {@link ObjectId} form.
+     *
+     * @param session the session to run the update in
+     * @param id      the {@code _id} value to match
+     * @param pairs   the field/value pairs to apply
+     * @return the number of documents modified
+     */
     @SafeVarargs
-    @Override
-    public final long update(MorphiaSession session, @NotNull String id, @NotNull Pair<String, Object>... pairs) {
+    private long updateInSession(MorphiaSession session, @NotNull Object id, @NotNull Pair<String, Object>... pairs) {
         List<UpdateOperator> updateOperators = new ArrayList<>();
         for (Pair<String, Object> pair : pairs) {
-            // check that the pair key corresponds to a field in the persistent class that is an enum
-            Field field = null;
             try {
-                field = getFieldFromHierarchy(getPersistentClass(),pair.getKey());
-                Reference ref = field.getAnnotation(Reference.class);
-                if (ref != null) {
-                    Log.warn("Update to class that contains references");
-                    throw new NotSupportedException("Field:" + field + " is a managed reference, and not updatable via put. Use Post");
-                }
-                if (hasOntologyPropertyAnnotation(field)) {
-                    Log.warn("Update to class that contains ontology properties");
-                    throw new NotSupportedException("Field:" + field + " is an ontology property, and not updatable via put. Use save() to update relationships");
-                }
-
-                if (field.getType().isEnum()) {
-                    // check that the pair value is a valid enum value of te field
-                    if (!Arrays.stream(field.getType().getEnumConstants()).anyMatch(e -> e.toString().equals(pair.getValue().toString()))) {
-                        throw new IllegalArgumentException("Invalid value for enum field " + pair.getKey() + " can't set value:" + pair.getValue());
-                    }
-
-                }
+                validateUpdatableField(getFieldFromHierarchy(getPersistentClass(), pair.getKey()), pair);
             } catch (NoSuchFieldException e) {
                 throw new RuntimeException(e);
             }
-            updateOperators.add(UpdateOperators.set(pair.getKey(), pair.getValue()));
+            updateOperators.add(buildUpdateOperator(pair.getKey(), pair.getValue()));
         }
         if (updateOperators.isEmpty()) {
             return 0;
         }
+
+        addAuditInfoUpdateOperators(updateOperators, securityIdentity.getPrincipal().getName());
 
         UpdateResult update;
         if (updateOperators.size() == 1) {
@@ -1342,6 +1657,12 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
         return update.getModifiedCount();
     }
 
+    @SafeVarargs
+    @Override
+    public final long update(MorphiaSession session, @NotNull String id, @NotNull Pair<String, Object>... pairs) {
+        return updateInSession(session, id, pairs);
+    }
+
     @Override
     @SafeVarargs
     public final long update(Datastore datastore, @NotNull String id, @NotNull Pair<String, Object>... pairs) throws InvalidStateTransitionException {
@@ -1353,7 +1674,6 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
     @SafeVarargs
     public final long update(Datastore datastore, @NotNull ObjectId id, @NotNull Pair<String, Object>... pairs) throws InvalidStateTransitionException {
        List<UpdateOperator> updateOperators = new ArrayList<>();
-       List<String> reservedFields = List.of("refName", "id", "version", "references", "auditInfo", "persistentEvents");
 
        // Fetch the current entity to validate state transitions
        Optional<T> currentEntityOpt = findById(datastore, id);
@@ -1363,10 +1683,6 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
        T currentEntity = currentEntityOpt.get();
 
        for (Pair<String, Object> pair : pairs) {
-          if (reservedFields.contains(pair.getKey())) {
-             throw new IllegalArgumentException("Field:" + pair.getKey() + " is a reserved field and can't be updated");
-          }
-
           Field field;
           try {
              field = getFieldFromHierarchy(getPersistentClass(), pair.getKey());
@@ -1383,37 +1699,8 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
                 );
              }
 
-             // Existing validation checks
-             Reference ref = field.getAnnotation(Reference.class);
-             if (ref != null) {
-                throw new NotSupportedException("Field:" + field + " is a managed reference, and not updatable via put. Use Post");
-             }
-             if (hasOntologyPropertyAnnotation(field)) {
-                throw new NotSupportedException("Field:" + field + " is an ontology property, and not updatable via put. Use save() to update relationships");
-             }
-
-             if (field.getType().isEnum()) {
-                if (!Arrays.stream(field.getType().getEnumConstants())
-                        .anyMatch(e -> e.toString().equals(pair.getValue().toString()))) {
-                   throw new IllegalArgumentException(
-                      "Invalid value for enum field " + pair.getKey() + " can't set value:" + pair.getValue());
-                }
-             }
-
-             if (field.getAnnotation(NotNull.class) != null && pair.getValue() == null) {
-                throw new IllegalArgumentException(
-                   "Field " + pair.getKey() + " is not nullable, but null value provided");
-             }
-
-             if (!field.getType().isAssignableFrom(pair.getValue().getClass())) {
-                throw new IllegalArgumentException(
-                   "Invalid value for field " + pair.getKey() +
-                      " can't set value:" + pair.getValue() +
-                      " expected type: " + field.getType().toString() +
-                      " but got: " + pair.getValue().getClass().getSimpleName());
-             }
-
-             updateOperators.add(UpdateOperators.set(pair.getKey(), pair.getValue()));
+             validateUpdatableField(field, pair);
+             updateOperators.add(buildUpdateOperator(pair.getKey(), pair.getValue()));
           } catch (NoSuchFieldException | IllegalAccessException e) {
              throw new RuntimeException(e);
           }
@@ -1427,8 +1714,7 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
           updateOperators.add(UpdateOperators.inc("version", 1));
        }
 
-       updateOperators.add(UpdateOperators.set("auditInfo.lastUpdateTs", new Date()));
-       updateOperators.add(UpdateOperators.set("auditInfo.lastUpdateIdentity", securityIdentity.getPrincipal().getName()));
+       addAuditInfoUpdateOperators(updateOperators, securityIdentity.getPrincipal().getName());
 
        UpdateResult update;
        if (updateOperators.size() == 1) {
@@ -1448,47 +1734,7 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
    @Override
    @SafeVarargs
     public final long update(MorphiaSession session, @NotNull ObjectId id, @NotNull Pair<String, Object>... pairs) {
-        List<UpdateOperator> updateOperators = new ArrayList<>();
-        for (Pair<String, Object> pair : pairs) {
-            // check that the pair key corresponds to a field in the persistent class that is an enum
-            Field field = null;
-            try {
-                field = getFieldFromHierarchy(getPersistentClass(),pair.getKey());
-                Reference ref = field.getAnnotation(Reference.class);
-                if (ref != null) {
-                    throw new NotSupportedException("Field:" + field + " is a managed reference, and not updatable via put. Use Post");
-                }
-                if (hasOntologyPropertyAnnotation(field)) {
-                    throw new NotSupportedException("Field:" + field + " is an ontology property, and not updatable via put. Use save() to update relationships");
-                }
-
-                if (field.getType().isEnum()) {
-                    // check that the pair value is a valid enum value of te field
-                    if (!Arrays.stream(field.getType().getEnumConstants()).anyMatch(e -> e.toString().equals(pair.getValue().toString()))) {
-                        throw new IllegalArgumentException("Invalid value for enum field " + pair.getKey() + " can't set value:" + pair.getValue());
-                    }
-
-                }
-            } catch (NoSuchFieldException e) {
-                throw new RuntimeException(e);
-            }
-            updateOperators.add(UpdateOperators.set(pair.getKey(), pair.getValue()));
-        }
-        if (updateOperators.isEmpty()) {
-            return 0;
-        }
-
-        UpdateResult update;
-        if (updateOperators.size() == 1) {
-            update = session.find(getPersistentClass()).filter(Filters.eq("_id", id))
-                    .update(updateOperators.get(0));
-        } else {
-            UpdateOperator[] ops = updateOperators.toArray(new UpdateOperator[0]);
-            update = session.find(getPersistentClass()).filter(Filters.eq("_id", id))
-                    .update(ops[0], Arrays.copyOfRange(ops, 1, ops.length));
-        }
-
-        return update.getModifiedCount();
+        return updateInSession(session, id, pairs);
     }
 
     // --- Bulk update implementations ---
@@ -1528,8 +1774,7 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
         if (BaseModel.class.isAssignableFrom(getPersistentClass())) {
             ops.add(UpdateOperators.inc("version", 1));
         }
-        ops.add(UpdateOperators.set("auditInfo.lastUpdateTs", new Date()));
-        ops.add(UpdateOperators.set("auditInfo.lastUpdateIdentity", securityIdentity.getPrincipal().getName()));
+        addAuditInfoUpdateOperators(ops, securityIdentity.getPrincipal().getName());
 
         UpdateOperator[] arr = ops.toArray(new UpdateOperator[0]);
         UpdateResult res = datastore.find(getPersistentClass()).filter(combineForMorphiaQuery(qfilters))
@@ -1572,8 +1817,7 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
         if (BaseModel.class.isAssignableFrom(getPersistentClass())) {
             ops.add(UpdateOperators.inc("version", 1));
         }
-        ops.add(UpdateOperators.set("auditInfo.lastUpdateTs", new Date()));
-        ops.add(UpdateOperators.set("auditInfo.lastUpdateIdentity", securityIdentity.getPrincipal().getName()));
+        addAuditInfoUpdateOperators(ops, securityIdentity.getPrincipal().getName());
 
         UpdateOperator[] arr = ops.toArray(new UpdateOperator[0]);
         UpdateResult res = datastore.find(getPersistentClass()).filter(combineForMorphiaQuery(qfilters))
@@ -1634,8 +1878,7 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
         if (BaseModel.class.isAssignableFrom(getPersistentClass())) {
             ops.add(UpdateOperators.inc("version", 1));
         }
-        ops.add(UpdateOperators.set("auditInfo.lastUpdateTs", new Date()));
-        ops.add(UpdateOperators.set("auditInfo.lastUpdateIdentity", securityIdentity.getPrincipal().getName()));
+        addAuditInfoUpdateOperators(ops, securityIdentity.getPrincipal().getName());
 
         UpdateOperator[] arr = ops.toArray(new UpdateOperator[0]);
         UpdateResult res = datastore.find(getPersistentClass()).filter(combineForMorphiaQuery(qfilters))
@@ -1643,41 +1886,31 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
         return res.getModifiedCount();
     }
 
+   /**
+    * Validates the supplied field/value pairs for the bulk update paths and turns them into update
+    * operators. Reserved fields are rejected, and each value is checked against the declared type
+    * of the field it targets.
+    *
+    * <p>A {@code null} value clears the field it targets, provided that field is not required. This
+    * is how a caller resets an optional field, such as clearing a stale error code when a record
+    * later succeeds.
+    *
+    * @param pairs the field/value pairs to apply
+    * @return the operators to include in the update
+    * @throws NotSupportedException    if a pair targets a managed reference or an ontology property
+    * @throws IllegalArgumentException if a pair targets a reserved field, supplies a value of the
+    *                                  wrong type, or supplies null for a non-nullable field
+    */
    @SafeVarargs
     private  List<UpdateOperator> buildValidatedUpdateOperators(@NotNull Pair<String, Object>... pairs) {
         Objects.requireNonNull(pairs, "update pairs must not be null");
         List<UpdateOperator> updateOperators = new ArrayList<>();
-        List<String> reservedFields = List.of("refName", "id", "version", "references", "auditInfo", "persistentEvents");
         for (Pair<String, Object> pair : pairs) {
-            if (reservedFields.contains(pair.getKey())) {
-                throw new IllegalArgumentException("Field:" + pair.getKey() + " is a reserved field and can't be updated");
-            }
             Field field;
             try {
                 field = getFieldFromHierarchy(getPersistentClass(), pair.getKey());
-                Reference ref = field.getAnnotation(Reference.class);
-                if (ref != null) {
-                    throw new NotSupportedException("Field:" + field + " is a managed reference, and not updatable via put. Use Post");
-                }
-                if (hasOntologyPropertyAnnotation(field)) {
-                    throw new NotSupportedException("Field:" + field + " is an ontology property, and not updatable via put. Use save() to update relationships");
-                }
-                if (field.getType().isEnum()) {
-                    if (!Arrays.stream(field.getType().getEnumConstants())
-                            .anyMatch(e -> e.toString().equals(String.valueOf(pair.getValue())))) {
-                        throw new IllegalArgumentException("Invalid value for enum field " + pair.getKey() + " can't set value:" + pair.getValue());
-                    }
-                }
-                if (field.getAnnotation(NotNull.class) != null && pair.getValue() == null) {
-                    throw new IllegalArgumentException("Field " + pair.getKey() + " is not nullable, but null value provided");
-                }
-                if (pair.getValue() != null && !field.getType().isAssignableFrom(pair.getValue().getClass())) {
-                    throw new IllegalArgumentException("Invalid value for field " + pair.getKey() +
-                            " can't set value:" + pair.getValue() +
-                            " expected type: " + field.getType() +
-                            " but got: " + pair.getValue().getClass().getSimpleName());
-                }
-                updateOperators.add(UpdateOperators.set(pair.getKey(), pair.getValue()));
+                validateUpdatableField(field, pair);
+                updateOperators.add(buildUpdateOperator(pair.getKey(), pair.getValue()));
             } catch (NoSuchFieldException e) {
                 throw new RuntimeException(e);
             }

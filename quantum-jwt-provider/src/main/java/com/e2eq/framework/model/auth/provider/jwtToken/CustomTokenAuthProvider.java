@@ -219,6 +219,17 @@ public class CustomTokenAuthProvider extends BaseAuthProvider implements AuthPro
    @Override
    public String createUser(String userId, String password, Boolean forceChangePassword,
                           Set<String> roles, DomainContext domainContext, DataDomain dataDomain) throws SecurityException {
+      return createUser(userId, password, forceChangePassword, roles, domainContext, dataDomain, null);
+   }
+
+   /**
+    * Local JWT provider has no Cognito email stamp; {@code portalAccess} is accepted for
+    * {@link UserManagement} API compatibility and ignored.
+    */
+   @Override
+   public String createUser(String userId, String password, Boolean forceChangePassword,
+                          Set<String> roles, DomainContext domainContext, DataDomain dataDomain,
+                          Boolean portalAccess) throws SecurityException {
       Objects.requireNonNull(userId, "UserId cannot be null");
 
       Objects.requireNonNull(password, "Password cannot be null");
