@@ -26,13 +26,33 @@ public class TestCommonUtils {
         m = VALID_EMAIL_ADDRESS_REGEX.matcher("test+1@test.com");
         assertTrue(m.matches());
 
-        assertTrue(ValidateUtils.isValidEmailAddress("test@test.com"));
-        assertTrue(ValidateUtils.isValidEmailAddress("test+1@test.com"));
-        //assertTrue(ValidateUtils.isValidEmailAddress("test_1@test.com"));  fails
+        List.of(
+            "test@test.com",
+            "test+1@test.com",
+            "test_1@test.com",
+            "mistoff_2000@yahoo.com",
+            "_lead@test.com",
+            "trail_@test.com",
+            "first.last@test.com",
+            "first-last@test.com",
+            "test+tag@test.com",
+            "o'brien@test.com",
+            "first.last_x@example.com"
+        ).forEach(email ->
+            assertTrue(ValidateUtils.isValidEmailAddress(email), email + " should be valid")
+        );
         assertTrue(VALID_EMAIL_ADDRESS_REGEX.matcher("test_1@test.com").matches());
-        assertFalse(ValidateUtils.isValidEmailAddress("test_1.xxx.com"));
-        assertFalse(ValidateUtils.isValidEmailAddress("test_1.xxx@xxx"));
-        assertFalse(ValidateUtils.isValidEmailAddress("!test@test.com"));
+
+        List.of(
+            "test_1.xxx.com",
+            "test_1.xxx@xxx",
+            "!test@test.com",
+            "test@",
+            "@test.com",
+            "a".repeat(65) + "@test.com"
+        ).forEach(email ->
+            assertFalse(ValidateUtils.isValidEmailAddress(email), email + " should be invalid")
+        );
     }
 
     @Test
