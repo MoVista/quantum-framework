@@ -37,7 +37,10 @@ public class TestCommonUtils {
             "first-last@test.com",
             "test+tag@test.com",
             "o'brien@test.com",
-            "first.last_x@example.com"
+            "first.last_x@example.com",
+            "bob@x.io",
+            "john@a.co",
+            "a".repeat(64) + "@test.com"
         ).forEach(email ->
             assertTrue(ValidateUtils.isValidEmailAddress(email), email + " should be valid")
         );
@@ -49,7 +52,12 @@ public class TestCommonUtils {
             "!test@test.com",
             "test@",
             "@test.com",
-            "a".repeat(65) + "@test.com"
+            "a".repeat(65) + "@test.com",
+            "a@ex..com",
+            "a@@ab.com",
+            "a@.ab.com",
+            "a@_ab.com",
+            "a@-ab.com"
         ).forEach(email ->
             assertFalse(ValidateUtils.isValidEmailAddress(email), email + " should be invalid")
         );
