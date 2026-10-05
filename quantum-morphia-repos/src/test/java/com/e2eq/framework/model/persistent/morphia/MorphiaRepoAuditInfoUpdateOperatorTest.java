@@ -1,5 +1,6 @@
 package com.e2eq.framework.model.persistent.morphia;
 
+import com.e2eq.framework.model.persistent.base.AuditInfoStamper;
 import com.e2eq.framework.model.persistent.base.DataDomain;
 import com.e2eq.framework.model.persistent.base.UnversionedBaseModel;
 import com.e2eq.framework.model.securityrules.PrincipalContext;
@@ -39,6 +40,7 @@ class MorphiaRepoAuditInfoUpdateOperatorTest {
         }
     }
 
+    // No SecurityIdentity is injected here, which stands in for a call without a request scope.
     private final TestRepo repo = new TestRepo();
 
     @AfterEach
@@ -96,6 +98,18 @@ class MorphiaRepoAuditInfoUpdateOperatorTest {
                 "$unset".equals(op.operator())
                         && String.valueOf(op.value()).contains("lastImpersonated")));
         assertEquals("$set", ops.get(0).operator());
+    }
+
+    @Test
+    void currentUpdateIdentity_withoutSecurityIdentity_fallsBackToPrincipalContext() {
+        SecurityContext.setPrincipalContext(baseBuilder().build());
+
+        assertEquals("john@acme.com", repo.currentUpdateIdentity());
+    }
+
+    @Test
+    void currentUpdateIdentity_withNoIdentityAtAll_isAnonymous() {
+        assertEquals(AuditInfoStamper.ANONYMOUS, repo.currentUpdateIdentity());
     }
 
     private static boolean hasUnset(List<UpdateOperator> ops, String field) {

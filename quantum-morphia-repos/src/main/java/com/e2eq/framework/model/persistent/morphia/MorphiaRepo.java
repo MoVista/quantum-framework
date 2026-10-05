@@ -54,6 +54,7 @@ import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import jakarta.enterprise.inject.Instance;
+import jakarta.enterprise.context.ContextNotActiveException;
 
 import java.lang.reflect.Field;
 import java.util.*;
@@ -1413,14 +1414,42 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
        return updateActiveStatus(morphiaDataStoreWrapper.getDataStore(getSecurityContextRealmId()), id, activeStatus);
    }
 
+   /**
+    * Stamps {@code auditInfo} and bumps {@code version} like the pair updates, so a soft delete
+    * reaches {@code lastUpdateTs}-based incremental exports and a stale copy can't save over it.
+    *
+    * @return the matched count (not the modified count, unlike the pair updates)
+    */
    @Override
    public long updateActiveStatus (Datastore datastore, @PathParam("id") ObjectId id, ActiveStatus activeStatus) {
-      UpdateOperator updateOp = UpdateOperators.set("activeStatus", activeStatus);
-      UpdateResult update;
-      update = datastore.find(getPersistentClass()).filter(Filters.eq("_id", id))
-                     .update(updateOp);
+      List<UpdateOperator> ops = new ArrayList<>();
+      ops.add(UpdateOperators.set("activeStatus", activeStatus));
+      if (BaseModel.class.isAssignableFrom(getPersistentClass())) {
+         ops.add(UpdateOperators.inc("version", 1));
+      }
+      addAuditInfoUpdateOperators(ops, currentUpdateIdentity());
+
+      UpdateOperator[] arr = ops.toArray(new UpdateOperator[0]);
+      UpdateResult update = datastore.find(getPersistentClass()).filter(Filters.eq("_id", id))
+                     .update(arr[0], Arrays.copyOfRange(arr, 1, arr.length));
 
      return update.getMatchedCount();
+   }
+
+   /**
+    * The request's {@link SecurityIdentity} name, or the {@link SecurityContext} principal's
+    * identity when the request is anonymous or there is no request scope (e.g. a background job).
+    */
+   protected String currentUpdateIdentity() {
+      try {
+         if (securityIdentity != null && !securityIdentity.isAnonymous()
+                 && securityIdentity.getPrincipal() != null) {
+            return securityIdentity.getPrincipal().getName();
+         }
+      } catch (ContextNotActiveException e) {
+         // No request scope; fall back to the security context below.
+      }
+      return AuditInfoStamper.identity(SecurityContext.getPrincipalContext().orElse(null));
    }
 
    @Override
