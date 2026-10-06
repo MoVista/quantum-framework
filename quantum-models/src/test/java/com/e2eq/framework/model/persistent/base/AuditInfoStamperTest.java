@@ -42,6 +42,32 @@ class AuditInfoStamperTest {
    }
 
    @Test
+   void create_stampsLastUpdateWithCreationValues() {
+      AuditInfo info = new AuditInfo();
+      Date now = new Date(1_700_000_000_000L);
+
+      AuditInfoStamper.stamp(info, targetUser(), true, now);
+
+      assertSame(now, info.getCreationTs());
+      assertSame(now, info.getLastUpdateTs());
+      assertEquals("john@acme.com", info.getCreationIdentity());
+      assertEquals(info.getCreationIdentity(), info.getLastUpdateIdentity());
+   }
+
+   @Test
+   void update_keepsCreationTs_advancesLastUpdateTs() {
+      AuditInfo info = new AuditInfo();
+      Date created = new Date(1_700_000_000_000L);
+      AuditInfoStamper.stamp(info, targetUser(), true, created);
+
+      Date later = new Date(1_700_000_100_000L);
+      AuditInfoStamper.stamp(info, impersonating(), false, later);
+
+      assertSame(created, info.getCreationTs());
+      assertSame(later, info.getLastUpdateTs());
+   }
+
+   @Test
    void impersonatedCreate_stampsCurrentWriteAndStickyPair() {
       AuditInfo info = new AuditInfo();
       Date now = new Date(1_700_000_000_000L);

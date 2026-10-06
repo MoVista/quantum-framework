@@ -29,16 +29,18 @@ public final class AuditInfoStamper {
    }
 
    /**
+    * Last-update fields are stamped on create too, with the same {@code now} as {@code creationTs},
+    * so {@code lastUpdateTs} is never null on a document written through this path.
+    *
     * @param creating true when this is the first persist (no {@code creationTs} yet)
     */
    public static void stamp(AuditInfo auditInfo, PrincipalContext ctx, boolean creating, Date now) {
       if (creating) {
          auditInfo.setCreationTs(now);
          auditInfo.setCreationIdentity(identity(ctx));
-      } else {
-         auditInfo.setLastUpdateTs(now);
-         auditInfo.setLastUpdateIdentity(identity(ctx));
       }
+      auditInfo.setLastUpdateTs(now);
+      auditInfo.setLastUpdateIdentity(identity(ctx));
       applyCurrentWrite(auditInfo, ctx);
       if (isImpersonating(ctx)) {
          if (ctx.getImpersonatedByUserId() != null) {
