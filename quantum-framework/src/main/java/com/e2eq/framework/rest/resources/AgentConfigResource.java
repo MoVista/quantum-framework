@@ -71,7 +71,7 @@ public class AgentConfigResource {
                     .entity("{\"error\":\"realm query parameter is required\"}")
                     .build();
         }
-        Optional<Agent> agent = agentRepo.findByRefName(realm, refName);
+        Optional<Agent> agent = agentRepo.findByRefName(refName, realm);
         return agent.map(a -> Response.ok(a).build())
                 .orElse(Response.status(Response.Status.NOT_FOUND)
                         .entity("{\"error\":\"agent not found: " + refName + "\"}")
@@ -139,7 +139,7 @@ public class AgentConfigResource {
                     .entity("{\"error\":\"realm query parameter is required\"}")
                     .build();
         }
-        Optional<Agent> agent = agentRepo.findByRefName(realm, refName);
+        Optional<Agent> agent = agentRepo.findByRefName(refName, realm);
         if (agent.isEmpty()) {
             return Response.status(Response.Status.NOT_FOUND)
                     .entity("{\"error\":\"agent not found: " + refName + "\"}")

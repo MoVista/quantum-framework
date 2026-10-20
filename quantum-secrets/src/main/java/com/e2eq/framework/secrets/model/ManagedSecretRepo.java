@@ -17,7 +17,8 @@ public class ManagedSecretRepo extends com.e2eq.framework.model.persistent.morph
         return query.iterator().toList();
     }
 
-    public Optional<ManagedSecret> findByRefName(String realmId, String refName) {
+    @Override
+    public Optional<ManagedSecret> findByRefName(String refName, String realmId) {
         if (refName == null || refName.isBlank()) {
             return Optional.empty();
         }

@@ -36,11 +36,11 @@ public class AgentRepo {
     /**
      * Finds an agent by refName within the realm.
      *
-     * @param realm   realm id
      * @param refName agent ref name (e.g. OBLIGATIONS_SUGGEST)
+     * @param realm   realm id
      * @return optional agent
      */
-    public Optional<Agent> findByRefName(String realm, String refName) {
+    public Optional<Agent> findByRefName(String refName, String realm) {
         if (realm == null || refName == null || refName.isBlank()) {
             return Optional.empty();
         }

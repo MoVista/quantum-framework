@@ -1,9 +1,14 @@
 package com.e2eq.framework.model.security;
 
 import com.e2eq.framework.model.persistent.base.BaseModel;
+import com.mongodb.client.model.CollationStrength;
+import dev.morphia.annotations.Collation;
 import dev.morphia.annotations.Entity;
+import dev.morphia.annotations.Field;
+import dev.morphia.annotations.Index;
 import dev.morphia.annotations.IndexOptions;
 import dev.morphia.annotations.Indexed;
+import dev.morphia.annotations.Indexes;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotNull;
@@ -12,7 +17,18 @@ import lombok.experimental.SuperBuilder;
 
 import java.util.Date;
 
+/*
+ * Realm refNames are globally unique, independent of dataDomain.tenantId: request routing resolves
+ * a realm by refName alone and uses it as the MongoDB database name, so two realms must never share
+ * a refName, including case variants (MongoDB also rejects database names differing only in case).
+ * This index is in addition to the reference indexes inherited from UnversionedBaseModel.
+ */
 @Entity
+@Indexes({
+   @Index(fields = @Field("refName"),
+      options = @IndexOptions(unique = true, collation = @Collation(locale = "en", strength = CollationStrength.SECONDARY),
+         name = Realm.REF_NAME_UNIQUE_INDEX))
+})
 @RegisterForReflection
 @Data
 @EqualsAndHashCode(callSuper = true)
@@ -20,6 +36,9 @@ import java.util.Date;
 @NoArgsConstructor
 @AllArgsConstructor
 public class Realm extends BaseModel {
+
+   /** Name of the global, case-insensitive unique index on {@code refName}. */
+   public static final String REF_NAME_UNIQUE_INDEX = "idx_realm_refName_unique";
 
    /**
     this is the last part of a given email which is being used as an identifier.  So

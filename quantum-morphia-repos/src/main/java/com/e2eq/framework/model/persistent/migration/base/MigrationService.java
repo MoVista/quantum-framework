@@ -6,6 +6,7 @@ import com.coditory.sherlock.mongo.MongoSherlock;
 import com.e2eq.framework.model.persistent.morphia.ChangeSetRecordRepo;
 import com.e2eq.framework.model.persistent.morphia.DatabaseVersionRepo;
 
+import com.e2eq.framework.model.persistent.morphia.DeclaredIndexes;
 import com.e2eq.framework.model.persistent.morphia.MorphiaDataStoreWrapper;
 import com.e2eq.framework.exceptions.DatabaseMigrationException;
 import com.e2eq.framework.model.securityrules.SecurityCallScope;
@@ -13,6 +14,8 @@ import com.e2eq.framework.util.SecurityUtils;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoCollection;
 import dev.morphia.Datastore;
+import dev.morphia.MorphiaDatastore;
+import dev.morphia.annotations.internal.IndexHelper;
 import dev.morphia.mapping.codec.pojo.EntityModel;
 import dev.morphia.transactions.MorphiaSession;
 import io.quarkus.logging.Log;
@@ -53,6 +56,13 @@ public class MigrationService {
 
    @ConfigProperty(name = "quantum.database.migration.enabled")
    protected boolean enabled;
+
+   /**
+    * How long a realm's migration lock is held. It must exceed the longest expected migration call
+    * (pending change sets plus the index step), otherwise another caller can acquire it mid-run.
+    */
+   @ConfigProperty(name = "quantum.database.migration.lock-duration", defaultValue = "PT30M")
+   protected java.time.Duration migrationLockDuration = java.time.Duration.ofMinutes(30);
 
    /**
     * Optional comma-separated list of additional realms to initialize on startup before seed packs run.
@@ -143,8 +153,13 @@ public class MigrationService {
          securityUtils.getSystemPrincipalContext(),
          securityUtils.getSystemSecurityResourceContext(),
          () -> {
-            runAllUnRunMigrations(realm, emitter);
-            applyAllIndexes(realm);
+            try {
+               runAllUnRunMigrations(realm, emitter);
+            } catch (IndexBuildException e) {
+               // Startup stays available; the deploy pipeline's migration call for this realm
+               // fails on the same error, and every migration call retries the index step.
+               Log.errorf(e, "Startup migration for realm %s completed but declared indexes could not all be applied", realm);
+            }
          }
       );
    }
@@ -221,7 +236,7 @@ public class MigrationService {
 
    public void applyIndexes (String realmId) {
       Objects.requireNonNull(realmId, "RealmId cannot be null");
-      morphiaDataStoreWrapper.getDataStore(realmId).applyIndexes();
+      DeclaredIndexes.ensureAll(morphiaDataStoreWrapper.getDataStore(realmId));
    }
 
    public void applyIndexes (String realmId, String collection) {
@@ -230,29 +245,95 @@ public class MigrationService {
       if (!em.isPresent()) {
          throw new NotFoundException(String.format("Collection %s not found in realm %s", collection, realmId));
       }
-      morphiaDataStoreWrapper.getDataStore(realmId).ensureIndexes(em.get().getType());
+      DeclaredIndexes.ensure(morphiaDataStoreWrapper.getDataStore(realmId), em.get().getType());
    }
 
    /**
-    * Ensures all Morphia-mapped entity collections exist in the realm database by applying indexes.
-    * This creates any missing collections (MongoDB creates a collection when the first index is created).
-    * Called after migrations so the system realm has all expected collections (e.g. credentialUserIdPassword, userProfile, policy, realm).
+    * Applies every mapped entity's declared indexes in a realm, logging progress. See
+    * {@link #applyAllIndexes(String, MultiEmitter)}.
+    *
+    * @param realmId the realm to apply indexes in
+    * @throws IndexBuildException when any entity's indexes could not be applied
     */
    public void applyAllIndexes(String realmId) {
+      applyAllIndexes(realmId, newLoggingEmitter());
+   }
+
+   /**
+    * Applies every mapped entity's declared indexes in a realm. This is the single place declared
+    * indexes are created; it runs at the end of every {@link #runAllUnRunMigrations} call.
+    *
+    * <p>Every entity is attempted. Failures are collected and thrown together as an
+    * {@link IndexBuildException}, so a failed build fails the migration call instead of being
+    * logged and skipped. Creating an index that already exists with the same name and definition
+    * is a no-op, and this also creates any missing mapped collection. The step is additive: an
+    * index that is no longer declared is reported as drift but never dropped; removals belong in
+    * explicit migrations.</p>
+    *
+    * @param realmId the realm to apply indexes in
+    * @param emitter receives progress and drift messages
+    * @throws IndexBuildException when any entity's indexes could not be applied
+    */
+   public void applyAllIndexes(String realmId, MultiEmitter<? super String> emitter) {
       Objects.requireNonNull(realmId);
-      var datastore = morphiaDataStoreWrapper.getDataStore(realmId);
-      var entities = datastore.getMapper().getMappedEntities();
-      Log.infof("applyAllIndexes: ensuring indexes for %d mapped entity types in realm %s", entities.size(), realmId);
-      for (var entity : entities) {
+      MorphiaDatastore datastore = morphiaDataStoreWrapper.getDataStore(realmId);
+      List<EntityModel> entities = new ArrayList<>(datastore.getMapper().getMappedEntities());
+      log(String.format("-- Applying declared indexes for %d mapped entity types in realm %s --", entities.size(), realmId), emitter);
+
+      List<String> failures = new ArrayList<>();
+      Map<String, Set<String>> declaredByCollection = new TreeMap<>();
+      IndexHelper indexHelper = new IndexHelper(datastore.getMapper());
+      for (EntityModel entity : entities) {
+         if (!DeclaredIndexes.isIndexable(entity)) {
+            continue;
+         }
          try {
-            datastore.ensureIndexes(entity.getType());
+            DeclaredIndexes.ensure(datastore, entity.getType());
             Log.debugf("applyAllIndexes: ensured indexes for %s in %s", entity.collectionName(), realmId);
          } catch (Exception e) {
-            Log.warnf(e, "applyAllIndexes: failed to ensure indexes for %s in %s", entity.collectionName(), realmId);
+            String failure = String.format("%s (%s): %s", entity.collectionName(), entity.getType().getSimpleName(), e.getMessage());
+            Log.errorf(e, "applyAllIndexes: failed to ensure indexes for %s in %s", entity.collectionName(), realmId);
+            log("!! Index build failed: " + failure, emitter);
+            failures.add(failure);
+         }
+         try {
+            declaredByCollection.computeIfAbsent(entity.collectionName(), name -> new TreeSet<>())
+                  .addAll(DeclaredIndexes.names(indexHelper, entity));
+         } catch (Exception e) {
+            Log.debugf(e, "applyAllIndexes: could not compute declared indexes for %s", entity.collectionName());
          }
       }
-      datastore.applyIndexes();
-      Log.infof("applyAllIndexes: completed for realm %s", realmId);
+
+      reportIndexDrift(datastore, declaredByCollection, emitter);
+
+      if (!failures.isEmpty()) {
+         throw new IndexBuildException(realmId, failures);
+      }
+      log(String.format("-- Declared indexes applied in realm %s --", realmId), emitter);
+   }
+
+   /**
+    * Reports indexes that exist in a collection but are no longer declared by any entity mapped to
+    * it (for example a replaced index). They are left in place; dropping one is a migration's job.
+    */
+   private void reportIndexDrift(MorphiaDatastore datastore, Map<String, Set<String>> declaredByCollection,
+                                 MultiEmitter<? super String> emitter) {
+      String realmId = datastore.getDatabase().getName();
+      for (Map.Entry<String, Set<String>> collection : declaredByCollection.entrySet()) {
+         try {
+            for (Document index : datastore.getDatabase().getCollection(collection.getKey()).listIndexes()) {
+               String name = index.getString("name");
+               if (name != null && !"_id_".equals(name) && !collection.getValue().contains(name)) {
+                  String message = String.format("Index drift in realm %s: collection %s has undeclared index %s %s",
+                        realmId, collection.getKey(), name, index.get("key"));
+                  Log.warn(message);
+                  emitter.emit("   " + message);
+               }
+            }
+         } catch (Exception e) {
+            Log.debugf(e, "applyAllIndexes: could not list indexes for %s in %s", collection.getKey(), realmId);
+         }
+      }
    }
 
    public void dropAllIndexes (String realmId) {
@@ -493,8 +574,11 @@ public class MigrationService {
 
       // get a lock first:
       DistributedLock lock = getMigrationLock(realm);
+      if (!lock.acquire(migrationLockDuration)) {
+         throw new MigrationInProgressException(realm);
+      }
       log(String.format("-- Got Migration Lock Executing change sets on database / realm:%s --", realm), emitter);
-      lock.runLocked(() -> {
+      try {
          MorphiaSession ds = morphiaDataStoreWrapper.getDataStore(realm).startSession();
          try {
             log(String.format("        Executing Change Set: %s in realm %s", changeSetBean.getName(), realm), emitter);
@@ -510,24 +594,53 @@ public class MigrationService {
          } finally {
             ds.close();
          }
-      });
+      } finally {
+         lock.release();
+      }
    }
 
+   /**
+    * Migrates a realm: runs its pending change sets, then applies every declared index
+    * ({@link #applyAllIndexes(String, MultiEmitter)}). The index step runs on every call, including
+    * when no change sets are pending, so an index added only to a model annotation reaches realms
+    * that are already up to date.
+    *
+    * <p>The whole call holds the realm's migration lock for {@code quantum.database.migration.lock-duration}.
+    * If another call holds it, this call fails with {@link MigrationInProgressException} instead of
+    * silently doing nothing.</p>
+    *
+    * @param realm the realm (database) to migrate
+    * @param emitter receives progress messages
+    * @throws MigrationInProgressException when the realm is already being migrated
+    * @throws IndexBuildException when declared indexes could not all be applied; each change set
+    *                             has already recorded its database version, and the next call
+    *                             retries the index step
+    */
    public void runAllUnRunMigrations (String realm, MultiEmitter<? super String> emitter) {
 
       Log.info("-- Running all migrations for realm: " + realm);
-      List<ChangeSetBean> changeSetList = getAllPendingChangeSetBeans(realm, emitter);
+      DistributedLock lock = getMigrationLock(realm);
+      if (!lock.acquire(migrationLockDuration)) {
+         throw new MigrationInProgressException(realm);
+      }
+      log(String.format("-- Got Migration Lock on database / realm:%s --", realm), emitter);
+      try {
+         runPendingChangeSets(realm, getAllPendingChangeSetBeans(realm, emitter), emitter);
+         applyAllIndexes(realm, emitter);
+      } finally {
+         lock.release();
+         log("-- Lock Released --", emitter);
+      }
+   }
+
+   private void runPendingChangeSets(String realm, List<ChangeSetBean> changeSetList, MultiEmitter<? super String> emitter) {
       if (!changeSetList.isEmpty()) {
          Log.infof("-------------- Migration Starting for: %s--------------", realm);
          emitter.emit(String.format("-------------- Migration Starting for: %s--------------", realm));
          // for each now execute the change set bean
          Log.infof("-- Executing %d change sets --", changeSetList.size());
          emitter.emit(String.format("-- Executing %d change sets --", changeSetList.size()));
-
-         // get a lock first:
-         DistributedLock lock = getMigrationLock(realm);
-         log(String.format("-- Got Migration Lock Executing change sets on database / realm:%s --", realm), emitter);
-         lock.runLocked(() -> {
+         {
             changeSetList.forEach(changeSetBean -> {
                log(String.format("    checking for previous execution of Change Set: %s, in database %s", changeSetBean.getName(), realm ), emitter);
                // first check if this change set has run already or not
@@ -554,7 +667,11 @@ public class MigrationService {
                         MorphiaSession ods = morphiaDataStoreWrapper.getDataStore(changeSetBean.getOverrideDatabaseName()).startSession();
 
                         DistributedLock olock = getMigrationLock(changeSetBean.getOverrideDatabaseName());
-                        olock.runLocked(() -> {
+                        if (!olock.acquire(migrationLockDuration)) {
+                           ods.close();
+                           throw new MigrationInProgressException(changeSetBean.getOverrideDatabaseName());
+                        }
+                        {
                            try {
                               Log.infof("        Starting Transaction for Change Set:%s on database: %s", changeSetBean.getName(), changeSetBean.getOverrideDatabaseName());
                               emitter.emit(String.format("        Starting Transaction for Change Set:%s", changeSetBean.getName()));
@@ -572,8 +689,9 @@ public class MigrationService {
                               throw new RuntimeException(e);
                            } finally {
                               ods.close();
+                              olock.release();
                            }
-                        });
+                        }
                      } else {
                         MorphiaSession ds = morphiaDataStoreWrapper.getDataStore(realm).startSession();
                         try {
@@ -601,10 +719,9 @@ public class MigrationService {
                   Log.infof("Change Set:%s has already been executed on database %s", changeSetBean.getName(), realm);
                }
                });
-               log(String.format("-- Lock Released --"), emitter);
                log("-- All Change Sets executed --", emitter);
                log(String.format("-------------- Migration Completed for: %s--------------", realm), emitter);
-            });
+            }
          } else {
             log(String.format("-- No pending change sets found for realm: %s", realm), emitter);
          }

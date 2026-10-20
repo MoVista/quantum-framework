@@ -254,7 +254,7 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
     public void ensureIndexes (String realmId, String collection) {
       Objects.requireNonNull(realmId, "RealmId cannot be null");
       Objects.requireNonNull(collection, "Collection cannot be null");
-      morphiaDataStoreWrapper.getDataStore(realmId).ensureIndexes(getPersistentClass());
+      DeclaredIndexes.ensure(morphiaDataStoreWrapper.getDataStore(realmId), getPersistentClass());
    }
 
 
@@ -354,8 +354,11 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
           qfilters = filters.toArray(qfilters);
        }
 
+        // Compare like the reference-identity unique index so "abc" finds an existing "ABC".
         Query<T> query = datastore.find(getPersistentClass()).filter(combineForMorphiaQuery(qfilters));
-        T obj = query.first();
+        List<T> matches = toListSkippingUnparseable(datastore, query,
+                new FindOptions().collation(RefNameMatching.COLLATION).limit(2));
+        T obj = matches.size() > 1 ? resolveAmbiguousRefName(datastore, qfilters, refName, matches) : matches.stream().findFirst().orElse(null);
 
         if (obj != null) {
             UIActionList uiActions = obj.calculateStateBasedUIActions();
@@ -364,6 +367,44 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
         }
 
         return Optional.ofNullable(obj);
+    }
+
+    /**
+     * Chooses one document when a reference lookup matches more than one. The reference-identity
+     * index allows one document per reference per tenant, so several matches mean a collection
+     * shared by tenants (the system realm) or duplicates created before the index existed. The
+     * caller's tenant is preferred, then an exact-case match, then the first match.
+     *
+     * @param datastore the datastore the lookup ran against
+     * @param filters the filters of the original lookup
+     * @param refName the requested reference
+     * @param matches at least two documents matched by the original lookup
+     * @return the chosen document
+     */
+    private T resolveAmbiguousRefName(Datastore datastore, Filter[] filters, String refName, List<T> matches) {
+        String tenantId = SecurityContext.getPrincipalContext()
+                .map(PrincipalContext::getDataDomain)
+                .map(DataDomain::getTenantId)
+                .orElse(null);
+        List<T> candidates = matches;
+        if (tenantId != null) {
+            Filter[] tenantFilters = Arrays.copyOf(filters, filters.length + 1);
+            tenantFilters[filters.length] = Filters.eq("dataDomain.tenantId", tenantId);
+            List<T> tenantMatches = toListSkippingUnparseable(datastore,
+                    datastore.find(getPersistentClass()).filter(combineForMorphiaQuery(tenantFilters)),
+                    new FindOptions().collation(RefNameMatching.COLLATION).limit(2));
+            if (!tenantMatches.isEmpty()) {
+                candidates = tenantMatches;
+            }
+        }
+        if (candidates.size() > 1 && tenantId != null && candidates != matches) {
+            Log.warnf("Reference %s matches more than one %s in tenant %s of %s; duplicates must be reconciled",
+                    refName, getPersistentClass().getSimpleName(), tenantId, datastore.getDatabase().getName());
+        }
+        return candidates.stream()
+                .filter(candidate -> refName.equals(candidate.getRefName()))
+                .findFirst()
+                .orElse(candidates.get(0));
     }
 
 
@@ -979,7 +1020,9 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
 
         filters.add(Filters.in("refName", refNames));
 
-        FindOptions findOptions = new FindOptions();
+        // Compare like the reference-identity unique index; returned refNames may differ in case
+        // from the requested ones, so match results with RefNameMatching rather than equals().
+        FindOptions findOptions = new FindOptions().collation(RefNameMatching.COLLATION);
 
         Query<T> query = datastore.find(getPersistentClass())
                 .filter(combineForMorphiaQuery(filters));

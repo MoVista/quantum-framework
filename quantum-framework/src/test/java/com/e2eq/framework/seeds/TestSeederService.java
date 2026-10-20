@@ -191,7 +191,7 @@ public class TestSeederService {
         String domain = safe(node.path("domain").asText());
         if (area.isEmpty() || domain.isEmpty()) return 0;
         try {
-            Optional<FunctionalDomain> existing = functionalDomainRepo.findByRefName(realm, domain);
+            Optional<FunctionalDomain> existing = functionalDomainRepo.findByRefName(domain, realm);
             FunctionalDomain fd = existing.orElseGet(FunctionalDomain::new);
             fd.setRefName(domain);
             fd.setArea(area);
@@ -372,7 +372,7 @@ public class TestSeederService {
         String principalId = safe(node.path("principalId").asText());
         if (refName.isEmpty() || principalId.isEmpty()) return 0;
         try {
-            policyRepo.findByRefName(realm, refName).ifPresent(existing -> {
+            policyRepo.findByRefName(refName, realm).ifPresent(existing -> {
                 try { policyRepo.delete(realm, existing); } catch (Exception ignored) {}
             });
 

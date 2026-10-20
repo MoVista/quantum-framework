@@ -94,7 +94,7 @@ public class MorphiaDataStoreWrapper {
 
       // Apply indexes and document validations
       if (baseConfig.applyIndexes()) {
-         mdatastore.applyIndexes();
+         DeclaredIndexes.ensureAll(mdatastore);
       }
 
       if (baseConfig.applyDocumentValidations()) {

@@ -1,0 +1,93 @@
+package com.e2eq.framework.migration;
+
+import com.e2eq.framework.model.persistent.base.ExcludeInheritedIndexes;
+import com.e2eq.framework.model.persistent.base.UnversionedBaseModel;
+import com.e2eq.framework.model.persistent.migration.base.MigrationService;
+import com.e2eq.framework.model.persistent.morphia.DeclaredIndexes;
+import com.e2eq.framework.model.persistent.morphia.MorphiaDataStoreWrapper;
+import com.e2eq.framework.test.ExcludedIndexTestModel;
+import com.e2eq.framework.test.UnversionedTestModel;
+import com.mongodb.client.MongoClient;
+import com.mongodb.client.MongoCollection;
+import dev.morphia.MorphiaDatastore;
+import dev.morphia.annotations.internal.IndexHelper;
+import io.quarkus.test.junit.QuarkusTest;
+import jakarta.inject.Inject;
+import org.bson.Document;
+import org.junit.jupiter.api.Test;
+
+import java.util.Set;
+import java.util.UUID;
+import java.util.stream.StreamSupport;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+/** {@link ExcludeInheritedIndexes} is honored by every framework path that creates declared indexes. */
+@QuarkusTest
+public class DeclaredIndexesTest {
+
+    @Inject
+    MorphiaDataStoreWrapper morphiaDataStoreWrapper;
+
+    @Inject
+    MigrationService migrationService;
+
+    @Inject
+    MongoClient mongoClient;
+
+    @Test
+    public void excludedInheritedIndexesAreLeftOutAndOwnIndexesApplied() {
+        String realm = "declared-indexes-test-" + UUID.randomUUID().toString().substring(0, 8);
+        try {
+            MorphiaDatastore datastore = morphiaDataStoreWrapper.getDataStore(realm);
+            datastore.getMapper().map(ExcludedIndexTestModel.class);
+
+            DeclaredIndexes.ensure(datastore, ExcludedIndexTestModel.class);
+            DeclaredIndexes.ensure(datastore, UnversionedTestModel.class);
+            // The post-migration index step and the per-realm apply endpoint take the same path.
+            migrationService.applyAllIndexes(realm);
+            migrationService.applyIndexes(realm);
+
+            Set<String> excluded = indexNames(collection(datastore, ExcludedIndexTestModel.class));
+            assertTrue(excluded.contains(ExcludedIndexTestModel.OWN_INDEX), excluded.toString());
+            assertFalse(excluded.contains(UnversionedBaseModel.REF_NAME_TENANT_UNIQUE_INDEX), excluded.toString());
+            assertFalse(excluded.contains(UnversionedBaseModel.REF_NAME_TENANT_LOOKUP_INDEX), excluded.toString());
+
+            Set<String> regular = indexNames(collection(datastore, UnversionedTestModel.class));
+            assertTrue(regular.contains(UnversionedBaseModel.REF_NAME_TENANT_UNIQUE_INDEX), regular.toString());
+            assertTrue(regular.contains(UnversionedBaseModel.REF_NAME_TENANT_LOOKUP_INDEX), regular.toString());
+
+            // Drift reporting compares against the same exclusion-aware names.
+            IndexHelper indexHelper = new IndexHelper(datastore.getMapper());
+            assertEquals(Set.of(ExcludedIndexTestModel.OWN_INDEX),
+                    DeclaredIndexes.names(indexHelper, datastore.getMapper().getEntityModel(ExcludedIndexTestModel.class)));
+        } finally {
+            mongoClient.getDatabase(realm).drop();
+        }
+    }
+
+    @Test
+    public void excludingAnIndexNoSuperclassDeclaresIsRejected() {
+        IllegalStateException failure = assertThrows(IllegalStateException.class,
+                () -> DeclaredIndexes.excludedNames(MisnamedExclusion.class));
+        assertTrue(failure.getMessage().contains("idx_not_declared"), failure.getMessage());
+    }
+
+    @ExcludeInheritedIndexes("idx_not_declared")
+    static class MisnamedExclusion extends UnversionedTestModel {
+    }
+
+    private static MongoCollection<Document> collection(MorphiaDatastore datastore, Class<?> type) {
+        return datastore.getDatabase().getCollection(datastore.getMapper().getEntityModel(type).collectionName());
+    }
+
+    private static Set<String> indexNames(MongoCollection<Document> collection) {
+        Set<String> names = new java.util.TreeSet<>();
+        StreamSupport.stream(collection.listIndexes().spliterator(), false)
+                .forEach(index -> names.add(index.getString("name")));
+        return names;
+    }
+}
