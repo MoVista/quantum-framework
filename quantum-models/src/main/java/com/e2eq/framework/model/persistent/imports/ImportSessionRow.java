@@ -57,6 +57,11 @@ public class ImportSessionRow extends BaseModel {
     // JSON-serialized T (target entity)
     private String recordJson;
 
+    /** Internal field snapshot for faithful replay; API JSON above remains a sanitized view. */
+    @com.fasterxml.jackson.annotation.JsonIgnore
+    @lombok.ToString.Exclude
+    private String recordStateJson;
+
     /** Exact row update mask after profile hooks; null for older/non-profile sessions. */
     private java.util.List<String> importedColumns;
 

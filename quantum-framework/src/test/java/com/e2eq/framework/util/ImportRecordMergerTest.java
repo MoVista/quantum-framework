@@ -274,4 +274,76 @@ class ImportRecordMergerTest {
         assertEquals("dark", merged.settings.get("theme"));
         assertEquals(Map.of("daily", 10, "monthly", 50), merged.settings.get("limits"));
     }
+
+    @Test
+    void valuesOnlyASetterReceivesAreReportedAndNotAppliedAsBlank() {
+        com.e2eq.framework.model.security.CredentialUserIdPassword existing =
+                new com.e2eq.framework.model.security.CredentialUserIdPassword();
+        existing.setPassword("original-password");
+        String originalHash = existing.getPasswordHash();
+        com.e2eq.framework.model.security.CredentialUserIdPassword incoming =
+                new com.e2eq.framework.model.security.CredentialUserIdPassword();
+        incoming.setPassword("replacement-password");
+        incoming.setDescription("Updated");
+
+        assertEquals(java.util.Set.of("password"), merger.uncarriedColumns(
+                com.e2eq.framework.model.security.CredentialUserIdPassword.class,
+                List.of("refName", "password", "description")));
+        var merged = merger.merge(existing, incoming, List.of("password", "description"));
+
+        assertEquals("Updated", merged.getDescription());
+        assertEquals(originalHash, merged.getPasswordHash(), "the caller applies or rejects the password");
+    }
+    public static class SecretAddress extends Address {
+        @com.fasterxml.jackson.annotation.JsonIgnore
+        public String secret;
+    }
+
+    @Test
+    void partialMapsKeepHiddenValuesAndUntouchedRuntimeTypes() {
+        Item current = existing();
+        SecretAddress home = new SecretAddress();
+        home.city = "Original";
+        home.secret = "hidden";
+        current.places.put("home", home);
+        java.util.Date created = new java.util.Date(1700000000000L);
+        current.settings.put("created", created);
+        Item incoming = new Item();
+        Address changed = new Address();
+        changed.city = "Changed";
+        incoming.places = Map.of("home", changed);
+        incoming.settings = Map.of("plan", "premium");
+
+        merger.merge(current, incoming, List.of("places.home.city", "settings.plan"));
+
+        assertEquals("Changed", current.places.get("home").city);
+        org.junit.jupiter.api.Assertions.assertSame(home, current.places.get("home"));
+        assertEquals("hidden", ((SecretAddress) current.places.get("home")).secret);
+        org.junit.jupiter.api.Assertions.assertSame(created, current.settings.get("created"));
+    }
+
+    @Test
+    void partialMapUpdatesSupportImmutableMapsAndNestedBlankEntries() {
+        Item current = existing();
+        current.settings = Map.of("limits", Map.of("daily", 5, "monthly", 50), "theme", "dark");
+        Item incoming = new Item();
+        incoming.settings = Map.of("limits", Map.of("monthly", 100));
+
+        merger.merge(current, incoming, List.of("settings.limits.daily", "settings.limits.monthly"));
+
+        assertEquals(Map.of("limits", Map.of("monthly", 100), "theme", "dark"), current.settings);
+    }
+
+    @Test
+    void partialUntypedMapsCanReplaceAScalarWithAnObject() {
+        Item current = existing();
+        current.settings = Map.of("limits", "legacy", "theme", "dark");
+        Item incoming = new Item();
+        incoming.settings = Map.of("limits", Map.of("daily", 10));
+
+        merger.merge(current, incoming, List.of("settings.limits.daily"));
+
+        assertEquals(Map.of("limits", Map.of("daily", 10), "theme", "dark"), current.settings);
+    }
+
 }

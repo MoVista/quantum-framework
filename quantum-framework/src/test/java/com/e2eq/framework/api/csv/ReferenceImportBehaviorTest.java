@@ -420,31 +420,76 @@ public class ReferenceImportBehaviorTest extends BaseRepoTest {
             var profile = userProfileRepo.createUser(userId, "Cross", "Tenant", false, new String[] {"user"},
                     "Passw0rd-xtenant", securityUtils.getDefaultDomainContext());
             var credential = credentialRepo.findByUserId(userId, systemRealm, true).orElseThrow();
+            var additional = new com.e2eq.framework.model.security.CredentialUserIdPassword();
+            additional.setUserId("token-" + userId);
+            additional.setSubject(UUID.randomUUID().toString());
+            additional.setRefName(additional.getSubject());
+            additional.setDomainContext(credential.getDomainContext());
+            additional.setLastUpdate(new java.util.Date());
+            additional.setRoles(new String[]{"user"});
+            additional.setCredentialType(com.e2eq.framework.model.security.CredentialType.SERVICE_TOKEN);
+            additional.setParentCredentialSubject(credential.getSubject());
+            credentialRepo.save(additional);
+            profile.setAdditionalCredentialRefs(List.of(additional.createEntityReference(systemRealm)));
+            userProfileRepo.save(profile);
             // As for a tenant's initial admin, whose credential carries the provisioning caller's tenant.
             var ds = morphiaDataStoreWrapper.getDataStore(systemRealm);
             ds.getDatabase().getCollection(ds.getMapper().getEntityModel(
                     com.e2eq.framework.model.security.CredentialUserIdPassword.class).collectionName())
-                    .updateOne(Filters.eq("_id", credential.getId()),
+                    .updateMany(Filters.in("_id", List.of(credential.getId(), additional.getId())),
                             new Document("$set", new Document("dataDomain.tenantId", "provisioning-tenant.example")));
 
-            // Permission rules may scope credentials by tenant; the framework itself must not, so with
-            // rules bypassed the global credential reference resolves and the cascade deletes it.
+            // Ordinary credential rules hide this record, but deleting its authorized profile must
+            // still revoke the attached credential.
             assertTrue(credentialRepo.findByRefName(ds, credential.getRefName(), true).isPresent(),
                     "a credential's reference is global, not scoped to the caller's tenant");
-            try (var bypass = com.e2eq.framework.model.securityrules.SecurityCallScope.openIgnoringRules()) {
-                userProfileRepo.delete(testUtils.getTestRealm(), profile);
-            }
-
+            assertTrue(credentialRepo.findByRefName(ds, credential.getRefName(), false).isEmpty());
+            assertEquals(1, userProfileRepo.delete(testUtils.getTestRealm(), profile.getId()));
+            assertFalse(com.e2eq.framework.model.securityrules.SecurityContext.isIgnoringRules());
             assertTrue(credentialRepo.findByUserId(userId, systemRealm, true).isEmpty());
+            assertTrue(credentialRepo.findByUserId("token-" + userId, systemRealm, true).isEmpty());
         } finally {
             var ds = morphiaDataStoreWrapper.getDataStore(systemRealm);
             ds.getDatabase().getCollection(ds.getMapper().getEntityModel(
                     com.e2eq.framework.model.security.CredentialUserIdPassword.class).collectionName())
-                    .deleteMany(Filters.eq("userId", userId));
+                    .deleteMany(Filters.in("userId", List.of(userId, "token-" + userId)));
             var tds = morphiaDataStoreWrapper.getDataStore(testUtils.getTestRealm());
             tds.getDatabase().getCollection(tds.getMapper().getEntityModel(
                     com.e2eq.framework.model.security.UserProfile.class).collectionName())
-                    .deleteMany(Filters.eq("userId", userId));
+                    .deleteMany(Filters.in("userId", List.of(userId, "token-" + userId)));
+        }
+    }
+
+    @Test
+    public void profileCascadeUsesPersistedReferencesAndRequiresAnAuthorizedProfile() throws Exception {
+        String firstId = "cascade-first-" + UUID.randomUUID().toString().substring(0, 8) + "@test.example";
+        String secondId = "cascade-second-" + UUID.randomUUID().toString().substring(0, 8) + "@test.example";
+        try (final SecuritySession ignored = new SecuritySession(pContext, rContext)) {
+            var first = userProfileRepo.createUser(firstId, "First", "Owner", false, new String[]{"user"},
+                    "Passw0rd-cascade", securityUtils.getDefaultDomainContext());
+            var second = userProfileRepo.createUser(secondId, "Second", "Owner", false, new String[]{"user"},
+                    "Passw0rd-cascade", securityUtils.getDefaultDomainContext());
+            // A caller cannot replace the persisted reference just by passing a different object to delete.
+            first.setCredentialUserIdPasswordRef(second.getCredentialUserIdPasswordRef());
+            assertEquals(1, userProfileRepo.delete(testUtils.getTestRealm(), first));
+            assertTrue(credentialRepo.findByUserId(firstId, testUtils.getSystemRealm(), true).isEmpty());
+            assertTrue(credentialRepo.findByUserId(secondId, testUtils.getSystemRealm(), true).isPresent());
+
+            var ds = morphiaDataStoreWrapper.getDataStore(testUtils.getTestRealm());
+            ds.getDatabase().getCollection(ds.getMapper().getEntityModel(com.e2eq.framework.model.security.UserProfile.class).collectionName())
+                    .updateOne(Filters.eq("_id", second.getId()), new Document("$set", new Document("dataDomain.tenantId", "invisible.example")));
+            assertEquals(0, userProfileRepo.delete(testUtils.getTestRealm(), second));
+            assertTrue(credentialRepo.findByUserId(secondId, testUtils.getSystemRealm(), true).isPresent());
+            assertFalse(com.e2eq.framework.model.securityrules.SecurityContext.isIgnoringRules());
+        } finally {
+            for (String realm : List.of(testUtils.getSystemRealm(), testUtils.getTestRealm())) {
+                var ds = morphiaDataStoreWrapper.getDataStore(realm);
+                for (Class<?> type : List.of(com.e2eq.framework.model.security.CredentialUserIdPassword.class,
+                        com.e2eq.framework.model.security.UserProfile.class)) {
+                    ds.getDatabase().getCollection(ds.getMapper().getEntityModel(type).collectionName())
+                            .deleteMany(Filters.in("userId", List.of(firstId, secondId)));
+                }
+            }
         }
     }
 
@@ -612,6 +657,219 @@ public class ReferenceImportBehaviorTest extends BaseRepoTest {
         } finally {
             deleteByRefPattern(ref);
             deleteByRefPattern(changed);
+        }
+    }
+
+    @Test
+    public void directImportUpdateAppliesValuesOnlyASetterReceives() {
+        String ref = unique("WriteOnly");
+        try (final SecuritySession ignored = new SecuritySession(pContext, rContext)) {
+            HiddenFieldImportModel original = new HiddenFieldImportModel();
+            original.setRefName(ref);
+            original.setRequiredKey("key");
+            original.setSecret("original");
+            hiddenRepo.save(original);
+
+            var result = csvImportHelper.importCSV(hiddenRepo,
+                    stream("refName,displayName,secret\n" + ref + ",Replaced,replacement\n"), ',', '"', true,
+                    List.of("refName", "displayName", "secret"), StandardCharsets.UTF_8, false,
+                    "QUOTE_WHERE_ESSENTIAL", record -> { });
+
+            assertEquals(1, result.getUpdateCount(), result.getRowResults().toString());
+            Document saved = hiddenCollection().find(Filters.eq("refName", ref)).first();
+            assertNotNull(saved);
+            assertEquals("hashed:replacement", saved.getString("secretHash"));
+            assertEquals("Replaced", saved.getString("displayName"));
+            assertEquals("key", saved.getString("requiredKey"));
+        } finally {
+            hiddenCollection().deleteMany(Filters.eq("refName", ref));
+        }
+    }
+
+    @Test
+    public void virtualSetterReplayKeepsTheCsvColumnOrder() {
+        try (final SecuritySession ignored = new SecuritySession(pContext, rContext)) {
+            for (boolean aliasFirst : List.of(true, false)) {
+                String ref = unique("VirtualSetterOrder");
+                try {
+                    var original = new HiddenFieldImportModel();
+                    original.setRefName(ref); original.setRequiredKey("key"); hiddenRepo.save(original);
+                    List<String> columns = aliasFirst
+                            ? List.of("refName", "displayAlias", "displayName")
+                            : List.of("refName", "displayName", "displayAlias");
+                    String values = aliasFirst ? ",alias,explicit" : ",explicit,alias";
+                    var result = csvImportHelper.importCSV(hiddenRepo, stream(String.join(",", columns) + "\n" + ref + values + "\n"),
+                            ',', '"', true, columns, StandardCharsets.UTF_8, false, "QUOTE_WHERE_ESSENTIAL", record -> { });
+                    assertEquals(1, result.getUpdateCount(), result.getRowResults().toString());
+                    assertEquals(aliasFirst ? "explicit" : "derived:alias",
+                            hiddenCollection().find(Filters.eq("refName", ref)).first().getString("displayName"));
+                } finally { hiddenCollection().deleteMany(Filters.eq("refName", ref)); }
+            }
+        }
+    }
+
+    @Test
+    public void previewSessionsRejectValuesOnlyASetterReceives() throws IOException {
+        String ref = unique("WriteOnlySession");
+        List<String> columns = List.of("refName", "displayName", "secret");
+        try (final SecuritySession ignored = new SecuritySession(pContext, rContext)) {
+            HiddenFieldImportModel original = new HiddenFieldImportModel();
+            original.setRefName(ref);
+            original.setRequiredKey("key");
+            original.setSecret("original");
+            hiddenRepo.save(original);
+            String csv = "refName,displayName,secret\n" + ref + ",Replaced,replacement\n";
+
+            var plain = csvImportHelper.analyzeCSV(hiddenRepo, stream(csv), ',', '"', true, columns,
+                    StandardCharsets.UTF_8, false, "QUOTE_WHERE_ESSENTIAL");
+            var profile = csvImportHelper.analyzeCSVWithProfile(hiddenRepo, stream(csv), new ImportProfile(), columns,
+                    testUtils.getTestRealm());
+
+            for (var preview : List.of(plain, profile)) {
+                assertEquals(1, preview.getErrorRows());
+                assertTrue(preview.getRowResults().get(0).getErrors().stream()
+                        .anyMatch(error -> error.getMessage().contains("secret")),
+                        preview.getRowResults().get(0).getErrors().toString());
+                assertEquals(0, csvImportHelper.commitImport(preview.getSessionId(), hiddenRepo).getImported());
+            }
+            Document saved = hiddenCollection().find(Filters.eq("refName", ref)).first();
+            assertNotNull(saved);
+            assertEquals("hashed:original", saved.getString("secretHash"));
+            assertFalse("Replaced".equals(saved.getString("displayName")));
+        } finally {
+            hiddenCollection().deleteMany(Filters.eq("refName", ref));
+        }
+    }
+
+    @Inject
+    com.e2eq.framework.persistent.GlobalIdentityImportModelRepo globalRepo;
+
+    @Test
+    public void importUpdatesAGlobalIdentityStampedWithAnotherTenant() throws Exception {
+        String ref = unique("Global");
+        MorphiaDatastore datastore = morphiaDataStoreWrapper.getDataStore(testUtils.getTestRealm());
+        MongoCollection<Document> collection = mongoClient.getDatabase(testUtils.getTestRealm()).getCollection(
+                datastore.getMapper().getEntityModel(com.e2eq.framework.test.GlobalIdentityImportModel.class).collectionName());
+        try (final SecuritySession ignored = new SecuritySession(pContext, rContext)) {
+            var original = new com.e2eq.framework.test.GlobalIdentityImportModel();
+            original.setRefName(ref);
+            original.setDisplayName("Original");
+            original.setTestField("kept");
+            globalRepo.save(original);
+            // As for a credential carrying its provisioning caller's tenant.
+            collection.updateOne(Filters.eq("_id", original.getId()),
+                    new Document("$set", new Document("dataDomain.tenantId", "provisioning-tenant.example")));
+
+            // Permission rules may scope reads by tenant; the import helper itself must not, so with rules
+            // bypassed the matched global record is updated rather than inserted again or rejected.
+            CSVImportHelper.ImportResult<com.e2eq.framework.test.GlobalIdentityImportModel> result;
+            try (var bypass = com.e2eq.framework.model.securityrules.SecurityCallScope.openIgnoringRules()) {
+                result = csvImportHelper.importCSV(globalRepo, stream("refName,displayName\n" + ref + ",Updated\n"),
+                        ',', '"', true, COLUMNS, StandardCharsets.UTF_8, false, "QUOTE_WHERE_ESSENTIAL", record -> { });
+            }
+
+            assertEquals(1, result.getUpdateCount(), result.getRowResults().toString());
+            assertEquals(1, collection.countDocuments(refFilter(ref)));
+            Document saved = collection.find(Filters.eq("_id", original.getId())).first();
+            assertNotNull(saved);
+            assertEquals("Updated", saved.getString("displayName"));
+            assertEquals("kept", saved.getString("testField"));
+        } finally {
+            collection.deleteMany(refFilter(ref));
+        }
+    }
+
+    @Inject
+    com.fasterxml.jackson.databind.ObjectMapper jsonMapper;
+
+    @Test
+    public void persistedSessionsKeepHiddenInsertValuesAndExplicitBlanks() throws IOException {
+        List<String> columns = List.of("refName", "requiredKey", "secret", "status");
+        try (final SecuritySession ignored = new SecuritySession(pContext, rContext)) {
+            for (boolean withProfile : List.of(false, true)) {
+                String ref = unique("HiddenSessionInsert");
+                try {
+                    String csv = "refName,requiredKey,secret,status\n" + ref + ",key,supplied,\n";
+                    var preview = withProfile
+                            ? csvImportHelper.analyzeCSVWithProfile(hiddenRepo, stream(csv), new ImportProfile(), columns,
+                                    testUtils.getTestRealm())
+                            : csvImportHelper.analyzeCSV(hiddenRepo, stream(csv), ',', '"', true, columns,
+                                    StandardCharsets.UTF_8, false, "QUOTE_WHERE_ESSENTIAL");
+                    assertEquals(0, preview.getErrorRows(), preview.getRowResults().toString());
+                    var row = importSessionRowRepo.findByRefName(ImportSessionRow.stagingRefName(preview.getSessionId(), 1)).orElseThrow();
+                    assertNotNull(row.getRecordStateJson());
+                    assertFalse(row.getRecordJson().contains("secretHash"));
+                    assertFalse(jsonMapper.valueToTree(row).has("recordStateJson"), "internal state must not be exposed by row APIs");
+                    assertEquals(1, csvImportHelper.commitImport(preview.getSessionId(), hiddenRepo).getImported());
+                    Document saved = hiddenCollection().find(Filters.eq("refName", ref)).first();
+                    assertNotNull(saved);
+                    assertEquals("hashed:supplied", saved.getString("secretHash"));
+                    assertNull(saved.get("status"));
+                } finally { hiddenCollection().deleteMany(Filters.eq("refName", ref)); }
+            }
+        }
+    }
+
+    @Test
+    public void persistedSessionUpdatesClearDefaultedFieldsAndRejectLegacyState() throws IOException {
+        try (final SecuritySession ignored = new SecuritySession(pContext, rContext)) {
+            for (boolean withProfile : List.of(false, true)) {
+                String ref = unique("BlankSessionUpdate");
+                try {
+                    var original = new HiddenFieldImportModel();
+                    original.setRefName(ref); original.setRequiredKey("key"); original.setSecret("original");
+                    hiddenRepo.save(original);
+                    List<String> columns = List.of("refName", "status");
+                    String csv = "refName,status\n" + ref + ",\n";
+                    var preview = withProfile
+                            ? csvImportHelper.analyzeCSVWithProfile(hiddenRepo, stream(csv), new ImportProfile(), columns,
+                                    testUtils.getTestRealm())
+                            : csvImportHelper.analyzeCSV(hiddenRepo, stream(csv), ',', '"', true, columns,
+                                    StandardCharsets.UTF_8, false, "QUOTE_WHERE_ESSENTIAL");
+                    assertEquals(0, preview.getErrorRows());
+                    assertEquals(1, csvImportHelper.commitImport(preview.getSessionId(), hiddenRepo).getImported());
+                    Document saved = hiddenCollection().find(Filters.eq("refName", ref)).first();
+                    assertNull(saved.get("status"));
+                    assertEquals("hashed:original", saved.getString("secretHash"));
+                    assertEquals("key", saved.getString("requiredKey"));
+
+                    var legacy = csvImportHelper.analyzeCSV(hiddenRepo, stream(csv), ',', '"', true, columns,
+                            StandardCharsets.UTF_8, false, "QUOTE_WHERE_ESSENTIAL");
+                    var row = importSessionRowRepo.findByRefName(ImportSessionRow.stagingRefName(legacy.getSessionId(), 1)).orElseThrow();
+                    row.setRecordStateJson(null);
+                    importSessionRowRepo.save(row);
+                    var commit = csvImportHelper.commitImport(legacy.getSessionId(), hiddenRepo);
+                    assertEquals(0, commit.getImported());
+                    assertEquals(1, commit.getFailed());
+                } finally { hiddenCollection().deleteMany(Filters.eq("refName", ref)); }
+            }
+        }
+    }
+
+    @Test
+    public void credentialBatchLookupUsesTheSystemDatabaseForATenantCaller() throws Exception {
+        String userId = "credential-import-" + UUID.randomUUID().toString().substring(0, 8) + "@test.example";
+        try (final SecuritySession ignored = new SecuritySession(pContext, rContext)) {
+            var profile = userProfileRepo.createUser(userId, "Import", "Target", false, new String[]{"user"},
+                    "Passw0rd-import", securityUtils.getDefaultDomainContext());
+            var credential = credentialRepo.findByUserId(userId, testUtils.getSystemRealm(), true).orElseThrow();
+            String ref = credential.getRefName();
+            var result = csvImportHelper.importCSV(credentialRepo, stream("refName,description\n" + ref + ",Updated\n"),
+                    ',', '"', true, List.of("refName", "description"), StandardCharsets.UTF_8, false,
+                    "QUOTE_WHERE_ESSENTIAL", record -> { });
+            assertEquals(1, result.getUpdateCount(), result.getRowResults().toString());
+            assertEquals("Updated", credentialRepo.findByUserId(userId, testUtils.getSystemRealm(), true).orElseThrow().getDescription());
+            assertEquals(credential.getPasswordHash(), credentialRepo.findByUserId(userId, testUtils.getSystemRealm(), true).orElseThrow().getPasswordHash());
+            assertEquals(1, userProfileRepo.delete(testUtils.getTestRealm(), profile));
+        } finally {
+            for (String realm : List.of(testUtils.getSystemRealm(), testUtils.getTestRealm())) {
+                var ds = morphiaDataStoreWrapper.getDataStore(realm);
+                for (Class<?> type : List.of(com.e2eq.framework.model.security.CredentialUserIdPassword.class,
+                        com.e2eq.framework.model.security.UserProfile.class)) {
+                    ds.getDatabase().getCollection(ds.getMapper().getEntityModel(type).collectionName())
+                            .deleteMany(Filters.eq("userId", userId));
+                }
+            }
         }
     }
 

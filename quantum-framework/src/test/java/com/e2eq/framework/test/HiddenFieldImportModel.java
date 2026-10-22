@@ -32,6 +32,11 @@ public class HiddenFieldImportModel extends BaseModel {
         }
     }
 
+    /** A virtual input that also changes an ordinary API-visible field. */
+    public void setDisplayAlias(String alias) {
+        setDisplayName(alias == null ? null : "derived:" + alias);
+    }
+
     @Override
     public String bmFunctionalArea() { return "TEST"; }
     @Override

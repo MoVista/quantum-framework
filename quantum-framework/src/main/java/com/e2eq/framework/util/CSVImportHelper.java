@@ -10,6 +10,7 @@ import com.e2eq.framework.imports.spi.PreValidationTransformer;
 import com.e2eq.framework.model.persistent.base.BaseModel;
 import com.e2eq.framework.model.persistent.base.DynamicAttributeSet;
 import com.e2eq.framework.model.persistent.base.DynamicAttributeSupport;
+import com.e2eq.framework.model.persistent.base.GlobalReferenceIdentity;
 import com.e2eq.framework.model.persistent.base.UnversionedBaseModel;
 import com.e2eq.framework.model.persistent.imports.ImportIntent;
 import com.e2eq.framework.model.persistent.imports.ImportProfile;
@@ -59,6 +60,8 @@ import static java.lang.String.format;
 
 @ApplicationScoped
 public class CSVImportHelper {
+    public static final String CREDENTIAL_DIRECT_IMPORT_REQUIRED =
+            "Credential imports require direct CSV import at POST /user/credentials/csv. Session imports are not supported.";
     private static final int BATCH_SIZE = 1000;
     private static final int PREVIEW_LIMIT = 100;
     // Fallback in-memory session store for environments without CDI injection (e.g., unit tests)
@@ -86,6 +89,13 @@ public class CSVImportHelper {
     DynamicAttributeImportService dynamicAttributeImportService;
 
     private volatile ImportRecordMerger recordMerger;
+    private volatile ImportRecordStateCodec recordStateCodec;
+
+    private static void requireSessionImportSupported(Class<?> type) {
+        if (com.e2eq.framework.model.security.CredentialUserIdPassword.class.isAssignableFrom(type)) {
+            throw new jakarta.ws.rs.BadRequestException(CREDENTIAL_DIRECT_IMPORT_REQUIRED);
+        }
+    }
 
     public <T> void validateBean(T bean) {
         Set<ConstraintViolation<T>> violations = validator.validate(bean);
@@ -536,6 +546,9 @@ public class CSVImportHelper {
 
         ImportResult<T> result = new ImportResult<>(0, 0);
         List<String> importedColumns = List.of(fieldMapping);
+        Map<T, String> raws = new IdentityHashMap<>();
+        UncarriedColumnWriter<T> uncarriedWriter = uncarriedColumnWriter(repo.getPersistentClass(), importedColumns,
+                fieldMapping, preference, processors, raws);
 
         // Duplicate groups are known only at EOF. Spool the raw CSV rows instead of retaining the
         // whole object graph, then parse them again and save non-conflicting rows in bounded
@@ -576,7 +589,6 @@ public class CSVImportHelper {
             Map<Integer, String> conflicts = references.conflicts();
             List<T> batch = new ArrayList<>(BATCH_SIZE);
             Map<T, Integer> rowNums = new IdentityHashMap<>();
-            Map<T, String> raws = new IdentityHashMap<>();
             try (ICsvDozerBeanReader replay = new CsvDozerBeanReader(
                     Files.newBufferedReader(spool, StandardCharsets.UTF_8), preference)) {
                 replay.configureBeanMapping(repo.getPersistentClass(), fieldMapping);
@@ -613,7 +625,7 @@ public class CSVImportHelper {
                     }
                     batch.add(bean);
                     if (batch.size() >= BATCH_SIZE) {
-                        saveDirectBatch(repo, batch, failedRecordHandler, result, rowNums, raws, importedColumns);
+                        saveDirectBatch(repo, batch, failedRecordHandler, result, rowNums, raws, importedColumns, uncarriedWriter);
                         batch.clear();
                         rowNums.clear();
                         raws.clear();
@@ -621,7 +633,7 @@ public class CSVImportHelper {
                 }
             }
             if (!batch.isEmpty()) {
-                saveDirectBatch(repo, batch, failedRecordHandler, result, rowNums, raws, importedColumns);
+                saveDirectBatch(repo, batch, failedRecordHandler, result, rowNums, raws, importedColumns, uncarriedWriter);
             }
         } finally {
             Files.deleteIfExists(spool);
@@ -632,10 +644,48 @@ public class CSVImportHelper {
 
     private <T extends UnversionedBaseModel> void saveDirectBatch(
             BaseMorphiaRepo<T> repo, List<T> batch, FailedRecordHandler<T> failedRecordHandler,
-            ImportResult<T> result, Map<T, Integer> rowNums, Map<T, String> raws, List<String> columns) {
+            ImportResult<T> result, Map<T, Integer> rowNums, Map<T, String> raws, List<String> columns,
+            UncarriedColumnWriter<T> uncarriedWriter) {
         int importedBefore = result.getImportedCount();
-        processBatch(repo, batch, failedRecordHandler, result, rowNums, raws, columns);
+        processBatch(repo, batch, failedRecordHandler, result, rowNums, raws, columns, Map.of(), uncarriedWriter);
         result.validRows += result.getImportedCount() - importedBefore;
+    }
+
+    /**
+     * Applies an imported row's columns that a merge cannot carry (see
+     * {@link ImportRecordMerger#uncarriedColumns}) to the existing record the row updates.
+     */
+    private interface UncarriedColumnWriter<T> {
+        void write(T row, T target) throws IOException;
+    }
+
+    /**
+     * A direct import still has each row's CSV text, so it reads the uncarried columns of an UPDATE
+     * row onto the existing record through the same mapping and cell processors as the first pass.
+     * Their setters therefore run exactly as for an insert (a {@code password} column is hashed).
+     */
+    private <T> UncarriedColumnWriter<T> uncarriedColumnWriter(Class<T> type, List<String> columns,
+            String[] fieldMapping, CsvPreference preference, CellProcessor[] processors, Map<T, String> raws) {
+        Set<String> uncarried = recordMerger().uncarriedColumns(type, columns);
+        if (uncarried.isEmpty()) {
+            return (row, target) -> { };
+        }
+        String[] mapping = java.util.Arrays.stream(fieldMapping)
+                .map(column -> uncarried.contains(ImportRecordMerger.normalize(column)) ? column : null)
+                .toArray(String[]::new);
+        org.dozer.DozerBeanMapper dozer = new org.dozer.DozerBeanMapper();
+        new CsvDozerBeanReader(new StringReader(""), preference, dozer).configureBeanMapping(type, mapping);
+        return (row, target) -> {
+            String raw = raws.get(row);
+            if (raw == null) {
+                throw new IOException("The imported row's values for " + uncarried + " are no longer available");
+            }
+            try (ICsvDozerBeanReader reader = new CsvDozerBeanReader(new StringReader(raw), preference, dozer)) {
+                if (reader.read(target, processors) == null) {
+                    throw new IOException("The imported row's values for " + uncarried + " could not be read");
+                }
+            }
+        };
     }
 
     public <T extends UnversionedBaseModel> ImportResult<T> preProcessBatch(
@@ -700,7 +750,7 @@ public class CSVImportHelper {
             Map<T, String> raws,
             List<String> importedColumns) {
 
-        return processBatch(repo, batch, failedRecordHandler, result, rowNums, raws, importedColumns, Map.of());
+        return processBatch(repo, batch, failedRecordHandler, result, rowNums, raws, importedColumns, Map.of(), null);
     }
 
     private <T extends UnversionedBaseModel> ImportResult<T> processBatch(
@@ -710,11 +760,13 @@ public class CSVImportHelper {
             ImportResult<T> result,
             Map<T, Integer> rowNums,
             Map<T, String> raws,
-            List<String> importedColumns, Map<T, List<String>> rowColumns) {
+            List<String> importedColumns, Map<T, List<String>> rowColumns,
+            UncarriedColumnWriter<T> uncarriedWriter) {
 
         if (batch.isEmpty()) return result;
 
         Map<String, T> existing = findExistingByRefName(repo, batch);
+        Map<List<String>, Set<String>> uncarriedByColumns = new IdentityHashMap<>();
         List<T> saved = new ArrayList<>(batch.size());
         List<T> toSave = new ArrayList<>(batch.size());
         int batchInserts = 0, batchUpdates = 0;
@@ -735,10 +787,26 @@ public class CSVImportHelper {
                         bean.getRefName()));
                 continue;
             }
+            Set<String> uncarried = !columnsKnown ? Set.of() : uncarriedByColumns.computeIfAbsent(columns,
+                    imported -> recordMerger().uncarriedColumns(repo.getPersistentClass(), imported));
+            if (!uncarried.isEmpty() && uncarriedWriter == null && current != null) {
+                // A staged session row was stored as JSON, which has already lost these values.
+                rejectRow(bean, failedRecordHandler, result, rowNums, raws, FieldErrorCode.VALIDATION,
+                        uncarriedColumnsMessage(uncarried));
+                continue;
+            }
             try {
                 // Merge onto the freshly loaded document rather than a JSON copy: the API mapper
                 // omits persisted @JsonIgnore fields (for example a credential's password hash).
-                T candidate = current == null ? bean : recordMerger().merge(current, bean, columns);
+                T candidate = current == null ? bean : current;
+                if (current != null && !uncarried.isEmpty()) {
+                    uncarriedWriter.write(bean, candidate);
+                }
+                if (current != null) {
+                    // A virtual setter may also fill visible fields. Apply the final parsed values
+                    // afterwards so replay cannot override a later explicit column in the CSV.
+                    candidate = recordMerger().merge(candidate, bean, columns);
+                }
                 validateBean(candidate);
                 saved.add(bean);
                 toSave.add(candidate);
@@ -793,12 +861,24 @@ public class CSVImportHelper {
                 List<T> firstHalf = new ArrayList<>(saved.subList(0, midPoint));
                 List<T> secondHalf = new ArrayList<>(saved.subList(midPoint, saved.size()));
 
-                processBatch(repo, firstHalf, failedRecordHandler, result, rowNums, raws, importedColumns, rowColumns);
-                processBatch(repo, secondHalf, failedRecordHandler, result, rowNums, raws, importedColumns, rowColumns);
+                processBatch(repo, firstHalf, failedRecordHandler, result, rowNums, raws, importedColumns, rowColumns,
+                        uncarriedWriter);
+                processBatch(repo, secondHalf, failedRecordHandler, result, rowNums, raws, importedColumns, rowColumns,
+                        uncarriedWriter);
             }
         }
 
         return result;
+    }
+
+    /**
+     * Why a preview session rejects an UPDATE row with columns that only a direct import can apply.
+     * A staged row is stored as JSON, which cannot hold them, so the update could not apply them.
+     */
+    static String uncarriedColumnsMessage(Set<String> uncarried) {
+        return format("Column(s) %s set values that a preview session cannot apply to an existing record (for "
+                + "example a password, which is stored only as a hidden hash); import them with a direct import.",
+                String.join(", ", uncarried));
     }
 
     /** Reports one imported record as a failed row. */
@@ -819,6 +899,15 @@ public class CSVImportHelper {
 
     private ObjectMapper mapper() {
         return objectMapper != null ? objectMapper : new ObjectMapper();
+    }
+
+    private ImportRecordStateCodec recordStateCodec() {
+        ImportRecordStateCodec codec = recordStateCodec;
+        if (codec == null) {
+            codec = new ImportRecordStateCodec(mapper());
+            recordStateCodec = codec;
+        }
+        return codec;
     }
 
     @SuppressWarnings("unchecked")
@@ -851,8 +940,11 @@ public class CSVImportHelper {
         if (refNames.isEmpty()) {
             return existing;
         }
-        String tenant = SecurityContext.getPrincipalContext()
-                .map(PrincipalContext::getDataDomain).map(DataDomain::getTenantId).orElse(null);
+        // A global identity (for example a credential stamped with its provisioning tenant) matches
+        // regardless of the tenant stamped on it; permission filters still apply to the lookup.
+        String tenant = repo.getPersistentClass().isAnnotationPresent(GlobalReferenceIdentity.class) ? null
+                : SecurityContext.getPrincipalContext()
+                        .map(PrincipalContext::getDataDomain).map(DataDomain::getTenantId).orElse(null);
         for (T found : repo.getListFromRefNames(refNames)) {
             if (found.getRefName() != null) {
                 if (tenant != null && (found.getDataDomain() == null
@@ -884,6 +976,8 @@ public class CSVImportHelper {
             Charset charset,
             boolean mustUseBOM,
             String quotingStrategy) throws IOException {
+
+        requireSessionImportSupported(repo.getPersistentClass());
 
         ImportResult<T> result = new ImportResult<>(0, 0);
 
@@ -1147,6 +1241,7 @@ public class CSVImportHelper {
             ImportResult<T> aggregate, List<String> importedColumns) {
 
         Map<String, T> existing = findExistingByRefName(repo, batchBeans);
+        Set<String> uncarried = recordMerger().uncarriedColumns(repo.getPersistentClass(), importedColumns);
 
         for (int i = 0; i < batchBeans.size(); i++) {
             T bean = batchBeans.get(i);
@@ -1157,6 +1252,9 @@ public class CSVImportHelper {
             rr.setRefName(bean.getRefName());
             rr.setRecord(bean);
             rr.setIntent(exists(existing, bean) ? Intent.UPDATE : Intent.INSERT);
+            if (!uncarried.isEmpty() && exists(existing, bean)) {
+                rr.getErrors().add(new FieldError(null, uncarriedColumnsMessage(uncarried), FieldErrorCode.VALIDATION));
+            }
 
             // attach captured raw line (always; or gate this on errors if desired)
             String raw = rawByRowNum != null ? rawByRowNum.get(rn) : null;
@@ -1189,6 +1287,7 @@ public class CSVImportHelper {
     // Minimal commit: save all valid rows for INSERT/UPDATE from a session
     @SuppressWarnings("unchecked")
     public <T extends UnversionedBaseModel> CommitResult commitImport(String sessionId, BaseMorphiaRepo<T> repo) {
+        requireSessionImportSupported(repo.getPersistentClass());
         boolean memMode = (importSessionRepo == null || importSessionRowRepo == null);
         if (memMode) {
             ImportSession<T> session = (ImportSession<T>) MEMORY_SESSIONS.get(sessionId);
@@ -1210,7 +1309,7 @@ public class CSVImportHelper {
             }
             ImportResult<T> tmp = new ImportResult<>(0, 0);
             processBatch(repo, toSave, rec -> {
-            }, tmp, new IdentityHashMap<>(), new IdentityHashMap<>(), session.getImportedColumns(), rowColumns);
+            }, tmp, new IdentityHashMap<>(), new IdentityHashMap<>(), session.getImportedColumns(), rowColumns, null);
             logFailedRows(sessionId, tmp);
             session.setStatus("COMMITTED");
             return new CommitResult(tmp.getImportedCount(), tmp.getFailedCount());
@@ -1245,20 +1344,29 @@ public class CSVImportHelper {
                     continue;
                 }
                 try {
-                    T bean = objectMapper.readValue(r.getRecordJson(), repo.getPersistentClass());
+                    if (r.getRecordStateJson() == null) {
+                        throw new ValidationException("This import row was staged without a field snapshot; "
+                                + "preview the file again before committing it.");
+                    }
+                    T bean = recordStateCodec().read(r.getRecordStateJson(), repo.getPersistentClass());
                     toSave.add(bean);
                     rowNums.put(bean, r.getRowNumber());
                     if (r.getImportedColumns() != null && session.getImportedColumns() != null) {
                         rowColumns.put(bean, r.getImportedColumns());
                     }
                 } catch (Exception ex) {
-                    // the staged record can no longer be read as the target type
                     tmp.incrementFailedCount();
+                    tmp.incrementErrorRows();
+                    ImportRowResult<T> failed = new ImportRowResult<>();
+                    failed.setRowNumber(r.getRowNumber());
+                    failed.setRefName(r.getTargetRefName());
+                    failed.getErrors().add(new FieldError(null, ex.getMessage(), FieldErrorCode.PARSE));
+                    tmp.getRowResults().add(failed);
                 }
             }
             if (!toSave.isEmpty()) {
                 processBatch(repo, toSave, rec -> {
-                }, tmp, rowNums, new IdentityHashMap<>(), session.getImportedColumns(), rowColumns);
+                }, tmp, rowNums, new IdentityHashMap<>(), session.getImportedColumns(), rowColumns, null);
             }
             skip += page.size();
         }
@@ -1330,6 +1438,8 @@ public class CSVImportHelper {
             ImportProfile profile,
             List<String> requestedColumns,
             String realmId) throws IOException {
+
+        requireSessionImportSupported(repo.getPersistentClass());
 
         // Use profile settings or defaults
         char fieldSeparator = profile != null ? profile.getDelimiterChar() : ',';
@@ -1741,8 +1851,11 @@ public class CSVImportHelper {
             row.setErrorsJson(objectMapper.writeValueAsString(rowResult.getErrors()));
             if (rowResult.getRecord() != null) {
                 row.setRecordJson(objectMapper.writeValueAsString(rowResult.getRecord()));
+                row.setRecordStateJson(recordStateCodec().write(rowResult.getRecord()));
             }
-        } catch (Exception ignore) {
+        } catch (Exception ex) {
+            // A partial snapshot must never become a committable row.
+            throw new IllegalArgumentException("Unable to stage import row " + rowResult.getRowNumber(), ex);
         }
         return row;
     }
@@ -1831,6 +1944,10 @@ public class CSVImportHelper {
             rr.setRefName(bean.getRefName());
             rr.setRecord(bean);
             rr.setImportedColumns(rowColumns.get(bean));
+            Set<String> uncarried = recordMerger().uncarriedColumns(repo.getPersistentClass(), rowColumns.get(bean));
+            if (!uncarried.isEmpty() && exists) {
+                rr.getErrors().add(new FieldError(null, uncarriedColumnsMessage(uncarried), FieldErrorCode.VALIDATION));
+            }
 
             // Determine intent from profile or default
             Intent intent;

@@ -60,6 +60,7 @@ public final class ImportRecordMerger {
     private final ObjectMapper source;
     private final ObjectMapper deepMerge;
     private final ObjectMapper shallowMerge;
+    private final Map<String, Boolean> carriedPaths = new java.util.concurrent.ConcurrentHashMap<>();
 
     /**
      * Creates a merger that serializes and deserializes records with copies of the given mapper,
@@ -76,8 +77,8 @@ public final class ImportRecordMerger {
         for (Class<?> type : REPLACED_CONTAINER_TYPES) {
             deepMerge.configOverride(type).setMergeable(Boolean.FALSE);
         }
-        // Maps are replaced as well, including map types not listed above; the patch carries the
-        // untouched entries of a map whose individual keys were imported (see completeMaps).
+        // Whole-map columns replace maps, including implementations not listed above. Partial
+        // map paths are applied to the live values separately, without serializing untouched entries.
         SimpleModule arrays = new SimpleModule("import-array-replacement");
         arrays.setDeserializerModifier(new BeanDeserializerModifier() {
             @Override
@@ -124,12 +125,16 @@ public final class ImportRecordMerger {
      *                distinguish a property the file left out from one it set to its default
      *                (for example a primitive {@code false} or {@code 0})
      * @param <T> record type
-     * @return {@code existing}, updated
+     * @return {@code existing}, updated; columns listed by {@link #uncarriedColumns} are not applied
      * @throws IllegalArgumentException if no columns are given
      */
     public <T> T merge(T existing, T incoming, List<String> columns) {
         if (columns == null || columns.isEmpty()) {
             throw new IllegalArgumentException("The imported columns are required to update an existing record");
+        }
+        Set<String> uncarried = uncarriedColumns(existing.getClass(), columns);
+        if (!uncarried.isEmpty()) {
+            columns = columns.stream().filter(column -> !uncarried.contains(normalize(column))).toList();
         }
         JsonNode incomingTree = source.valueToTree(incoming);
         if (!(incomingTree instanceof ObjectNode incomingObject)) {
@@ -142,9 +147,67 @@ public final class ImportRecordMerger {
         if (patch.isEmpty()) {
             return existing;
         }
-        completeMaps(source.constructType(existing.getClass()), patch, existingObject, columns);
-        resolveRejectedBlanks(existing, patch, blankObjects);
-        return apply(existing, patch);
+        Set<String> selected = new java.util.LinkedHashSet<>();
+        columns.forEach(column -> selected.add(normalize(column)));
+        return applySelected(existing, patch, selected, blankObjects, "");
+    }
+
+    /**
+     * The imported paths whose values cannot pass through a record's JSON form: a property that a
+     * setter receives but that is never serialized (for example a password, stored only as a
+     * hidden hash), or one that is serialized but cannot be set. {@link #merge} leaves these out
+     * rather than applying them as blank; the caller must apply them another way or reject them, so
+     * an imported value is never silently ignored.
+     *
+     * @param type the record type
+     * @param columns the imported property paths
+     * @return the normalized paths that {@link #merge} does not apply
+     */
+    public Set<String> uncarriedColumns(Class<?> type, Collection<String> columns) {
+        Set<String> uncarried = new java.util.LinkedHashSet<>();
+        if (columns == null) {
+            return uncarried;
+        }
+        for (String column : columns) {
+            String path = normalize(column);
+            if (path.isEmpty() || PROTECTED_ROOTS.contains(path.split("\\.")[0])) {
+                continue;
+            }
+            if (!carriedPaths.computeIfAbsent(type.getName() + '#' + path,
+                    key -> isCarried(source.constructType(type), path))) {
+                uncarried.add(path);
+            }
+        }
+        return uncarried;
+    }
+
+    private boolean isCarried(JavaType type, String path) {
+        for (String segment : path.split("\\.")) {
+            if (type == null || type.isContainerType() && !isMap(type)) {
+                return true; // not known to be lost
+            }
+            if (isMap(type)) {
+                type = type.isMapLikeType() ? type.getContentType() : type;
+                continue;
+            }
+            BeanPropertyDefinition serialized = property(source.getSerializationConfig().introspect(type), segment);
+            BeanPropertyDefinition deserialized = property(source.getDeserializationConfig().introspect(type), segment);
+            if (serialized == null || !serialized.couldSerialize()
+                    || deserialized == null || !deserialized.couldDeserialize()) {
+                return false;
+            }
+            type = deserialized.getPrimaryType();
+        }
+        return true;
+    }
+
+    private static BeanPropertyDefinition property(com.fasterxml.jackson.databind.BeanDescription bean, String name) {
+        for (BeanPropertyDefinition property : bean.findProperties()) {
+            if (property.getName().equals(name)) {
+                return property;
+            }
+        }
+        return null;
     }
 
     /**
@@ -226,101 +289,87 @@ public final class ImportRecordMerger {
         return patch;
     }
 
-    /**
-     * An imported map replaces the existing one, so when the imported paths select individual keys
-     * of a map ({@code customAttributes.plan}) the patch must also carry the entries the file left
-     * out. Every object on such a path at or below the map is completed with the existing values it
-     * lacks, and a blank map entry is removed rather than stored as null. A path that selects the
-     * map itself, or an object inside it, replaces that value as imported.
-     */
-    private void completeMaps(JavaType rootType, ObjectNode patch, ObjectNode existing, Collection<String> columns) {
-        Set<String> whole = new java.util.HashSet<>();
-        Map<String, Boolean> partial = new java.util.LinkedHashMap<>(); // path -> is the value a map
-        for (String column : columns) {
-            String path = normalize(column);
-            if (path.isEmpty() || PROTECTED_ROOTS.contains(path.split("\\.")[0])) {
-                continue;
+    /** Apply partial maps to live Java values so unselected entries never pass through JSON. */
+    private <T> T applySelected(T existing, ObjectNode patch, Set<String> selected,
+            Set<String> blanks, String prefix) {
+        patchPartialMaps(existing, patch, selected, blanks, prefix);
+        if (!patch.isEmpty()) {
+            Set<String> localBlanks = new java.util.LinkedHashSet<>();
+            for (String blank : blanks) {
+                if (prefix.isEmpty()) localBlanks.add(blank);
+                else if (blank.startsWith(prefix + ".")) localBlanks.add(blank.substring(prefix.length() + 1));
             }
-            whole.add(path);
-            String[] segments = path.split("\\.");
-            JavaType type = rootType;
-            boolean inMap = false;
-            String prefix = "";
-            for (int i = 0; i < segments.length - 1 && type != null; i++) {
-                prefix = prefix.isEmpty() ? segments[i] : prefix + "." + segments[i];
-                type = propertyType(type, segments[i]);
-                inMap |= isMap(type);
-                if (inMap) {
-                    partial.merge(prefix, type != null && type.isMapLikeType(), Boolean::logicalOr);
-                }
-            }
+            resolveRejectedBlanks(existing, patch, localBlanks);
+            return apply(existing, patch);
         }
-        for (Map.Entry<String, Boolean> entry : partial.entrySet()) {
-            String path = entry.getKey();
-            if (whole.stream().anyMatch(selected -> path.equals(selected) || path.startsWith(selected + "."))) {
-                continue; // replaced as imported
-            }
-            if (!(nodeAt(patch, path) instanceof ObjectNode target)) {
-                continue; // cleared or replaced by a scalar
-            }
-            if (entry.getValue()) {
-                List<String> blank = new java.util.ArrayList<>();
-                target.fields().forEachRemaining(field -> {
-                    if (field.getValue().isNull()) {
-                        blank.add(field.getKey());
-                    }
-                });
-                target.remove(blank);
-                if (nodeAt(existing, path) instanceof ObjectNode current) {
-                    current.fields().forEachRemaining(field -> {
-                        if (!target.has(field.getKey()) && !blank.contains(field.getKey())) {
-                            target.set(field.getKey(), field.getValue().deepCopy());
-                        }
-                    });
-                }
-            } else if (nodeAt(existing, path) instanceof ObjectNode current) {
-                current.fields().forEachRemaining(field -> {
-                    if (!target.has(field.getKey())) {
-                        target.set(field.getKey(), field.getValue().deepCopy());
-                    }
-                });
+        return existing;
+    }
+
+    private void patchPartialMaps(Object existing, ObjectNode patch, Set<String> selected,
+            Set<String> blanks, String prefix) {
+        var type = source.constructType(existing.getClass());
+        var bean = source.getDeserializationConfig().introspect(type);
+        Iterator<Map.Entry<String, JsonNode>> fields = patch.fields();
+        while (fields.hasNext()) {
+            var field = fields.next();
+            String path = prefix.isEmpty() ? field.getKey() : prefix + "." + field.getKey();
+            if (selected.contains(path) || !(field.getValue() instanceof ObjectNode child)) continue;
+            BeanPropertyDefinition property = property(bean, field.getKey());
+            if (property == null || property.getAccessor() == null) continue;
+            var accessor = property.getAccessor();
+            accessor.fixAccess(true);
+            Object value = accessor.getValue(existing);
+            JavaType propertyType = property.getPrimaryType();
+            if (value instanceof Map<?, ?> || propertyType.isMapLikeType()) {
+                Object replacement = mergeMap(value instanceof Map<?, ?> map ? map : null,
+                        propertyType, child, selected, blanks, path);
+                var mutator = property.getNonConstructorMutator();
+                if (mutator == null) throw new IllegalArgumentException("Cannot update map '" + path + "'");
+                mutator.fixAccess(true);
+                mutator.setValue(existing, replacement);
+                fields.remove();
+            } else if (value != null) {
+                patchPartialMaps(value, child, selected, blanks, path);
+                if (child.isEmpty()) fields.remove();
             }
         }
     }
 
-    /** The declared type of a property or map value, or null if it cannot be determined. */
-    private JavaType propertyType(JavaType type, String name) {
-        if (isMap(type)) {
-            return type.isMapLikeType() ? type.getContentType() : type;
-        }
-        if (type.isContainerType() || type.isPrimitive()) {
-            return null;
-        }
-        for (BeanPropertyDefinition property : source.getDeserializationConfig().introspect(type).findProperties()) {
-            if (property.getName().equals(name)) {
-                return property.getPrimaryType();
+    @SuppressWarnings("unchecked")
+    private Map<Object, Object> mergeMap(Map<?, ?> current, JavaType type, ObjectNode patch,
+            Set<String> selected, Set<String> blanks, String prefix) {
+        JavaType keyType = type.isMapLikeType() ? type.getKeyType() : source.constructType(String.class);
+        JavaType valueType = type.isMapLikeType() ? type.getContentType() : source.constructType(Object.class);
+        Map<Object, Object> result = type.isMapLikeType()
+                ? source.convertValue(source.createObjectNode(), type) : new java.util.LinkedHashMap<>();
+        if (current != null) result.putAll(current);
+        patch.fields().forEachRemaining(field -> {
+            Object key = source.convertValue(field.getKey(), keyType);
+            String path = prefix + "." + field.getKey();
+            JsonNode node = field.getValue();
+            Object value = result.get(key);
+            if (node.isNull()) {
+                result.remove(key);
+            } else if (!selected.contains(path) && node instanceof ObjectNode child && value != null) {
+                if (value instanceof Map<?, ?> map) {
+                    result.put(key, mergeMap(map, valueType, child, selected, blanks, path));
+                } else if (valueType.hasRawClass(Object.class) && !source.valueToTree(value).isObject()) {
+                    // An untyped entry can change from a scalar to an object. There is no existing
+                    // object to patch in that case; build just the selected incoming value.
+                    result.put(key, source.convertValue(child, valueType));
+                } else {
+                    result.put(key, applySelected(value, child, selected, blanks, path));
+                }
+            } else {
+                result.put(key, source.convertValue(node, valueType));
             }
-        }
-        return null;
+        });
+        return result;
     }
 
-    /**
-     * Maps, and untyped values, which hold JSON objects as maps. Untyped values are completed but
-     * keep blank entries as null, since they merge into the existing value.
-     */
+    /** Maps and untyped values, whose object values are normally represented as maps. */
     private static boolean isMap(JavaType type) {
         return type != null && (type.isMapLikeType() || type.hasRawClass(Object.class));
-    }
-
-    private static JsonNode nodeAt(JsonNode root, String path) {
-        JsonNode node = root;
-        for (String segment : path.split("\\.")) {
-            if (node == null) {
-                return null;
-            }
-            node = node.get(segment);
-        }
-        return node;
     }
 
     /** Drops list indexes ({@code tags[0]} becomes {@code tags}) and surrounding whitespace. */

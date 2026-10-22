@@ -3,8 +3,10 @@ package com.e2eq.framework.migration;
 import com.e2eq.framework.model.persistent.base.ExcludeInheritedIndexes;
 import com.e2eq.framework.model.persistent.base.UnversionedBaseModel;
 import com.e2eq.framework.model.persistent.migration.base.MigrationService;
+import com.e2eq.framework.model.persistent.morphia.DeclaredIndexConfigInterceptor;
 import com.e2eq.framework.model.persistent.morphia.DeclaredIndexes;
 import com.e2eq.framework.model.persistent.morphia.MorphiaDataStoreWrapper;
+import com.e2eq.framework.model.persistent.morphia.NamedDatastoreDeclaredIndexes;
 import com.e2eq.framework.test.ExcludedIndexTestModel;
 import com.e2eq.framework.test.UnversionedTestModel;
 import com.mongodb.client.MongoClient;
@@ -87,6 +89,56 @@ public class DeclaredIndexesTest {
         } finally {
             mongoClient.getDatabase(realm).drop();
             mongoClient.getDatabase("pr33-auto-index-base").drop();
+        }
+    }
+
+    @Test
+    public void namedDatastoreKeepsItsRequestedIndexesWithExclusions() {
+        io.smallrye.config.SmallRyeConfig config = new io.smallrye.config.SmallRyeConfigBuilder()
+                .withMapping(com.end2endlogic.quantum.extension.QuarkusMorphiaConfig.class)
+                .withInterceptors(new DeclaredIndexConfigInterceptor())
+                .withSources(new io.smallrye.config.PropertiesConfigSource(java.util.Map.ofEntries(
+                        java.util.Map.entry("quarkus.morphia.database", "default"),
+                        java.util.Map.entry("quarkus.morphia.packages", "com.e2eq.framework.test"),
+                        java.util.Map.entry("quarkus.morphia.mapper-configs.archive.database", "archive"),
+                        java.util.Map.entry("quarkus.morphia.mapper-configs.archive.packages", "com.e2eq.framework.test"),
+                        java.util.Map.entry("quarkus.morphia.mapper-configs.archive.create-indexes", "true"),
+                        java.util.Map.entry("quarkus.morphia.mapper-configs.reporting.database", "reporting"),
+                        java.util.Map.entry("quarkus.morphia.mapper-configs.reporting.packages", "com.e2eq.framework.test"),
+                        java.util.Map.entry("quarkus.morphia.mapper-configs.reporting.create-indexes", "false"),
+                        java.util.Map.entry("quarkus.morphia.mapper-configs.omitted.database", "omitted"),
+                        java.util.Map.entry("quarkus.morphia.mapper-configs.omitted.packages", "com.e2eq.framework.test"),
+                        java.util.Map.entry("quarkus.morphia.mapper-configs.\"archive.dot\".database", "dotted"),
+                        java.util.Map.entry("quarkus.morphia.mapper-configs.\"archive.dot\".packages", "com.e2eq.framework.test"),
+                        java.util.Map.entry("quarkus.morphia.mapper-configs.\"archive.dot\".create-indexes", "true"),
+                        java.util.Map.entry("quarkus.morphia.create-indexes", "true")), "test", 100))
+                .build();
+        // The extension never creates indexes itself, for the default or a named datastore.
+        assertFalse(config.getValue("quarkus.morphia.mapper-configs.archive.create-indexes", Boolean.class));
+        assertFalse(config.getValue("quarkus.morphia.create-indexes", Boolean.class));
+        assertTrue(config.getValue(DeclaredIndexConfigInterceptor.requestedFor("archive"), Boolean.class));
+        assertFalse(config.getValue(DeclaredIndexConfigInterceptor.requestedFor("reporting"), Boolean.class));
+        assertTrue(config.getValue(DeclaredIndexConfigInterceptor.REQUESTED, Boolean.class));
+
+        String database = "pr33-named-index-" + UUID.randomUUID().toString().substring(0, 8);
+        MorphiaDatastore archive = new MorphiaDatastore(mongoClient,
+                dev.morphia.config.ManualMorphiaConfig.configure().database(database).applyIndexes(false));
+        archive.getMapper().map(ExcludedIndexTestModel.class, UnversionedTestModel.class);
+        try {
+            assertEquals(java.util.List.of("archive", "inherited", "archive.dot"), NamedDatastoreDeclaredIndexes.apply(config,
+                    java.util.List.of("archive", "reporting", "omitted", "inherited", "archive.dot"),
+                    client -> {
+                        assertFalse(java.util.Set.of("reporting", "omitted").contains(client));
+                        return java.util.Optional.of(archive);
+                    }));
+
+            Set<String> excluded = indexNames(collection(archive, ExcludedIndexTestModel.class));
+            assertTrue(excluded.contains(ExcludedIndexTestModel.OWN_INDEX), excluded.toString());
+            assertFalse(excluded.contains(UnversionedBaseModel.REF_NAME_TENANT_UNIQUE_INDEX), excluded.toString());
+            Set<String> regular = indexNames(collection(archive, UnversionedTestModel.class));
+            assertTrue(regular.contains(UnversionedBaseModel.REF_NAME_TENANT_UNIQUE_INDEX), regular.toString());
+        } finally {
+            mongoClient.getDatabase(database).drop();
         }
     }
 
