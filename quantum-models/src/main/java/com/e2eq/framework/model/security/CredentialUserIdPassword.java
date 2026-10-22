@@ -12,6 +12,7 @@ import com.mongodb.client.model.CollationStrength;
 import dev.morphia.annotations.*;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 import com.e2eq.framework.model.persistent.base.BaseModel;
+import com.e2eq.framework.model.persistent.base.GlobalReferenceIdentity;
 
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotEmpty;
@@ -24,6 +25,7 @@ import lombok.experimental.SuperBuilder;
 @Entity()
 @Data
 @EqualsAndHashCode(callSuper = true)
+@GlobalReferenceIdentity
 @RegisterForReflection
 @SuperBuilder
 @NoArgsConstructor

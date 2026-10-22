@@ -7,6 +7,8 @@ import com.e2eq.framework.security.runtime.RuleContext;
 import com.e2eq.framework.security.runtime.SecuritySession;
 import com.e2eq.framework.exceptions.DatabaseMigrationException;
 import com.e2eq.framework.util.TestUtils;
+import io.quarkus.arc.Arc;
+import io.quarkus.arc.ManagedContext;
 import io.quarkus.logging.Log;
 import io.quarkus.test.junit.QuarkusTest;
 import io.smallrye.mutiny.Multi;
@@ -35,32 +37,45 @@ public class BaseRepoTest {
         pContext = testUtils.getTestPrincipalContext(testUtils.getSystemUserId(), roles);
         rContext = testUtils.getResourceContext(testUtils.getArea(), "userProfile", "update");
         ruleContext.initDefaultRules( "security","userProfile", testUtils.getTestUserId());
-        // check if testDatabase has been migrated if not migrate it
+        // Change sets save through repositories that read the request-scoped SecurityIdentity, and
+        // @PostConstruct runs outside any request, so run the migration in a request context.
+        ManagedContext requestContext = Arc.container().requestContext();
+        boolean activated = !requestContext.isActive();
+        if (activated) {
+            requestContext.activate();
+        }
+        try {
+            // check if testDatabase has been migrated if not migrate it
 
-        try(final SecuritySession ignored = new SecuritySession(pContext, rContext)) {
-            try {
-                migrationService.checkMigrationRequired();
-            } catch (DatabaseMigrationException ex) {
-                Log.info("==== Attempting to run migration scripts ======");
+            try(final SecuritySession ignored = new SecuritySession(pContext, rContext)) {
+                try {
+                    migrationService.checkMigrationRequired();
+                } catch (DatabaseMigrationException ex) {
+                    Log.info("==== Attempting to run migration scripts ======");
 
-                // Use MultiEmitter to print emitted items to System.out; must complete emitter or stream never finishes
-                Multi.createFrom().emitter(emitter -> {
-                    try {
-                        migrationService.runAllUnRunMigrations(testUtils.getTestRealm(), emitter);
-                        migrationService.runAllUnRunMigrations(testUtils.getDefaultRealm(), emitter);
-                        migrationService.runAllUnRunMigrations(testUtils.getSystemRealm(), emitter);
-                    } finally {
-                        emitter.complete();
-                    }
-                }).subscribe().with(
-                   item -> System.out.println(item),
-                   failure -> System.err.println("Failed: " + failure.getMessage()),
-                   () -> Log.error("Migration Complete"));
+                    // Use MultiEmitter to print emitted items to System.out; must complete emitter or stream never finishes
+                    Multi.createFrom().emitter(emitter -> {
+                        try {
+                            migrationService.runAllUnRunMigrations(testUtils.getTestRealm(), emitter);
+                            migrationService.runAllUnRunMigrations(testUtils.getDefaultRealm(), emitter);
+                            migrationService.runAllUnRunMigrations(testUtils.getSystemRealm(), emitter);
+                        } finally {
+                            emitter.complete();
+                        }
+                    }).subscribe().with(
+                       item -> System.out.println(item),
+                       failure -> System.err.println("Failed: " + failure.getMessage()),
+                       () -> Log.error("Migration Complete"));
 
 
+                }
+            }
+
+        } finally {
+            if (activated) {
+                requestContext.terminate();
             }
         }
-
     }
 
 

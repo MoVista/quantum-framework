@@ -259,6 +259,11 @@ public class CredentialRepo extends MorphiaRepo<CredentialUserIdPassword> {
    }
 
    @Override
+   public List<CredentialUserIdPassword> getListFromRefNames(List<String> refNames) {
+      return super.getListFromRefNames(envConfigUtils.getSystemRealm(), refNames);
+   }
+
+   @Override
    public List<CredentialUserIdPassword> getAllList () {
       return this.getAllList(morphiaDataStoreWrapper.getDataStore(envConfigUtils.getSystemRealm()));
    }

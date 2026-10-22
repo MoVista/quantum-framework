@@ -55,6 +55,16 @@ public class MorphiaDataStoreWrapper {
 
    protected static final boolean ENABLE_ONE_DB_PER_TENANT = false;
 
+   @org.eclipse.microprofile.config.inject.ConfigProperty(name = DeclaredIndexConfigInterceptor.REQUESTED, defaultValue = "false")
+   boolean createDeclaredIndexes;
+
+   @jakarta.annotation.PostConstruct
+   void applyBaseDeclaredIndexes() {
+      if (createDeclaredIndexes) {
+         DeclaredIndexes.ensureAll(dataStore);
+      }
+   }
+
    public MorphiaDataStoreWrapper () {
    }
 
@@ -76,7 +86,7 @@ public class MorphiaDataStoreWrapper {
 
       // Clone the MorphiaConfig and override the database
       MorphiaConfig baseConfig = dataStore.getMapper().getConfig();
-      MorphiaConfig configForRealm = baseConfig.database(realm);
+      MorphiaConfig configForRealm = baseConfig.database(realm).applyIndexes(false);
 
       MorphiaDatastore mdatastore = new MorphiaDatastore(mongoClient, configForRealm);
 
@@ -93,8 +103,8 @@ public class MorphiaDataStoreWrapper {
       }
 
       // Apply indexes and document validations
-      if (baseConfig.applyIndexes()) {
-         mdatastore.applyIndexes();
+      if (createDeclaredIndexes) {
+         DeclaredIndexes.ensureAll(mdatastore);
       }
 
       if (baseConfig.applyDocumentValidations()) {

@@ -1,5 +1,6 @@
 package com.e2eq.ontology.model;
 
+import com.e2eq.framework.model.persistent.base.ExcludeInheritedIndexes;
 import com.e2eq.framework.model.persistent.base.UnversionedBaseModel;
 import dev.morphia.annotations.*;
 import lombok.Data;
@@ -14,6 +15,12 @@ import java.util.Map;
 @NoArgsConstructor
 @EqualsAndHashCode(callSuper = true)
 @Entity(value = "edges", useDiscriminator = false)
+// Edges are a derived cache identified by uniq_domain_src_p_dst, not by refName: the same
+// src|p|dst may exist once per org, account, and data segment within a tenant.
+@ExcludeInheritedIndexes({
+    UnversionedBaseModel.REF_NAME_TENANT_UNIQUE_INDEX,
+    UnversionedBaseModel.REF_NAME_TENANT_LOOKUP_INDEX
+})
 @Indexes({
     // DataDomain-scoped unique index: prevents collisions across orgs/accounts within same tenant
     @Index(options = @IndexOptions(name = "uniq_domain_src_p_dst", unique = true),

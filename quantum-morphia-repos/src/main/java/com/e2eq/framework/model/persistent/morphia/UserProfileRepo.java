@@ -248,33 +248,51 @@ public class UserProfileRepo extends MorphiaRepo<UserProfile> {
 
    @Override
    public long delete (String realmId, UserProfile obj) throws ReferentialIntegrityViolationException {
-      long ret = 0;
+      java.util.Objects.requireNonNull(obj, "The profile to delete is required");
+      java.util.Objects.requireNonNull(obj.getId(), "The profile id is required");
+      return delete(realmId, obj.getId());
+   }
 
-      // Delete primary credential
-      Optional<CredentialUserIdPassword> ocred = credentialRepo.findByRefName( obj.getCredentialUserIdPasswordRef().getEntityRefName(), (obj.getCredentialUserIdPasswordRef().getRealm() != null) ? obj.getCredentialUserIdPasswordRef().getRealm() : envConfigUtils.getSystemRealm());
-      if (ocred.isPresent()) {
-         credentialRepo.delete(ocred.get());
+   @Override
+   public long delete(String realmId, org.bson.types.ObjectId id) throws ReferentialIntegrityViolationException {
+      java.util.Objects.requireNonNull(id, "The profile id is required");
+      // Read using the caller's rules and use only persisted references, never references supplied
+      // on the object passed to delete. A failed or unauthorized profile delete cannot cascade.
+      Optional<UserProfile> existing = findById(id, realmId);
+      if (existing.isEmpty()) {
+         return 0;
       }
-
-      // Cascade-delete additional credentials (SERVICE_TOKEN, API_KEY, etc.)
-      if (obj.getAdditionalCredentialRefs() != null) {
-         for (EntityReference ref : obj.getAdditionalCredentialRefs()) {
-            Optional<CredentialUserIdPassword> additionalCred = credentialRepo.findByRefName(
-                    ref.getEntityRefName(),
-                    (ref.getRealm() != null) ? ref.getRealm() : envConfigUtils.getSystemRealm());
-            additionalCred.ifPresent(cred -> {
-               try {
-                  credentialRepo.delete(cred);
-               } catch (ReferentialIntegrityViolationException e) {
-                  Log.warnf("Failed to cascade-delete additional credential %s: %s",
-                          ref.getEntityRefName(), e.getMessage());
-               }
-            });
+      UserProfile stored = existing.get();
+      long deleted = super.delete(realmId, id);
+      if (deleted == 0) {
+         return 0;
+      }
+      // Deleting the profile authorizes deletion of its attached credentials. Their provisioning
+      // tenant can differ from the profile's, so credential read rules must not hide them here.
+      try (var ignored = com.e2eq.framework.model.securityrules.SecurityCallScope.openIgnoringRules()) {
+         deleteAttachedCredential(stored.getCredentialUserIdPasswordRef());
+         if (stored.getAdditionalCredentialRefs() != null) {
+            for (EntityReference ref : stored.getAdditionalCredentialRefs()) {
+               deleteAttachedCredential(ref);
+            }
          }
       }
+      return deleted;
+   }
 
-      ret= super.delete(realmId, obj);
-
-      return ret;
+   private void deleteAttachedCredential(EntityReference ref) throws ReferentialIntegrityViolationException {
+      if (ref == null) {
+         return;
+      }
+      String realm = ref.getRealm() != null ? ref.getRealm() : envConfigUtils.getSystemRealm();
+      // The stored id identifies the credential even if its reference spelling has changed. A
+      // missing id is supported for legacy profile references; an unmatched id never falls back
+      // to a potentially unrelated record with the same name.
+      Optional<CredentialUserIdPassword> credential = ref.getEntityId() != null
+            ? credentialRepo.findById(ref.getEntityId(), realm)
+            : credentialRepo.findByRefName(ref.getEntityRefName(), realm);
+      if (credential.isPresent() && credentialRepo.delete(realm, credential.get()) == 0) {
+         throw new IllegalStateException("Failed to delete attached credential " + ref.getEntityId());
+      }
    }
 }

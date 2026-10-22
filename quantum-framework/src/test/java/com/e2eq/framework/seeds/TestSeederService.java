@@ -191,7 +191,7 @@ public class TestSeederService {
         String domain = safe(node.path("domain").asText());
         if (area.isEmpty() || domain.isEmpty()) return 0;
         try {
-            Optional<FunctionalDomain> existing = functionalDomainRepo.findByRefName(realm, domain);
+            Optional<FunctionalDomain> existing = functionalDomainRepo.findByRefName(domain, realm);
             FunctionalDomain fd = existing.orElseGet(FunctionalDomain::new);
             fd.setRefName(domain);
             fd.setArea(area);
@@ -289,11 +289,12 @@ public class TestSeederService {
         String userId = safe(node.path("userId").asText());
         if (userId.isEmpty()) return 0;
         try {
-            Optional<UserProfile> existing = userProfileRepo.getByUserId(realm, userId);
+            // Fixture upserts must also find profiles outside the seeding principal's read filters.
+            Optional<UserProfile> existing = userProfileRepo.getByUserIdWithIgnoreRules(realm, userId);
             if (existing.isPresent()) return 0;
             UserProfile up = new UserProfile();
-            // Set refName to the realm so repository rule filters that key off refName can match
-            up.setRefName(realm);
+            // Profiles share a tenant namespace; each user's reference must be distinct.
+            up.setRefName(userId);
             up.setUserId(userId);
             up.setEmail(userId);
             // Use supplied dataDomain from seed for the target tenant
@@ -321,10 +322,11 @@ public class TestSeederService {
         String userId = safe(node.path("userId").asText());
         if (userId.isEmpty()) return 0;
         try {
-            Optional<UserProfile> existing = userProfileRepo.getByUserId(realm, userId);
+            // Fixture upserts must also find profiles outside the seeding principal's read filters.
+            Optional<UserProfile> existing = userProfileRepo.getByUserIdWithIgnoreRules(realm, userId);
             UserProfile up = existing.orElseGet(UserProfile::new);
-            // Ensure refName aligns with realm for repository rule filters
-            up.setRefName(realm);
+            // Match new profiles and repair the old realm-valued test fixture identity.
+            up.setRefName(userId);
             up.setUserId(userId);
             if (up.getEmail() == null) up.setEmail(userId);
             // Use supplied dataDomain from seed for the target tenant
@@ -372,7 +374,7 @@ public class TestSeederService {
         String principalId = safe(node.path("principalId").asText());
         if (refName.isEmpty() || principalId.isEmpty()) return 0;
         try {
-            policyRepo.findByRefName(realm, refName).ifPresent(existing -> {
+            policyRepo.findByRefName(refName, realm).ifPresent(existing -> {
                 try { policyRepo.delete(realm, existing); } catch (Exception ignored) {}
             });
 

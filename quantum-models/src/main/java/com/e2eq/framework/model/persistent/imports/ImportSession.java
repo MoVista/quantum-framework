@@ -49,6 +49,14 @@ public class ImportSession extends BaseModel {
     /** Reference to the ImportProfile used for this import (if any) */
     private String profileRefName;
 
+    /**
+     * Target property paths populated from the file's columns, in column order (for example
+     * {@code displayName} or {@code address.city}). On commit, an UPDATE row changes only these
+     * properties of the existing document. When null, UPDATE rows are rejected at commit, because
+     * the staged record cannot show which properties the file left out.
+     */
+    private java.util.List<String> importedColumns;
+
     @Override
     public String bmFunctionalArea() {
         return "IMPORTS";

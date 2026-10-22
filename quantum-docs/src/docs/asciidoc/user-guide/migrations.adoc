@@ -47,6 +47,8 @@ The following MicroProfile config properties influence migrations:
 - quantum.database.migration.changeset.package: package containing change sets (CDI still discovers beans via type, but this property documents the intended package).
 - quantum.migration.apply.realms: optional comma-separated list of additional realms to initialize during application startup. These startup migrations are evaluated before `SeedStartupRunner` runs, so realms listed here can be safely included in `quantum.seed-pack.apply.realms`.
 - quantum.realmConfig.systemRealm, quantum.realmConfig.defaultRealm, quantum.realmConfig.testRealm: well‑known realms used by MigrationResource when running migrations across environments. On startup, MigrationService checks whether the _system realm_ database exists and is initialized; if missing or uninitialized, it runs all pending change sets and applies indexes (creating all entity collections, including credentials). Set `quantum.realmConfig.systemRealm` to your application's system database name (e.g. `system-com`) in `application.properties` so the correct database is created and initialized when dropped or empty.
+- quantum.database.migration.lock-duration: how long a migration call holds a realm's migration lock (ISO-8601 duration, default `PT30M`). It must exceed the longest expected migration call, including the index step, or another caller could acquire the lock mid-run.
+- quantum.database.migration.heartbeat-interval: interval between SSE heartbeat comments while a migration endpoint runs (default `PT20S`; `PT0S` disables). Heartbeats keep idle-timeout proxies, such as a load balancer with a 60 second idle timeout, from dropping the connection during long silent steps.
 - quantum.defaultSystemPassword: initial password for the system user credential when created by the AddSystemUserCredential change set (default: `test123456`). Set in `application.properties`; the system user (quantum.realmConfig.systemUserId) is created in the credentials collection so login with that user works.
 - quantum.database.version: target schema version (e.g. 1.0.4). Must be at least 1.0.4 for the system user credential to be created during migration.
 
@@ -55,7 +57,8 @@ The following MicroProfile config properties influence migrations:
 - Discovery: MigrationService#getAllChangeSetBeans locates all CDI beans implementing ChangeSetBean.
 - Ordering: change sets are sorted by dbToVersionInt, then by priority (ascending). That ensures lower target versions apply before higher ones; priority resolves ties.
 - Pending selection: For the target realm, MigrationService#getAllPendingChangeSetBeans considers a change set pending if either (a) it has never run, (b) the bean’s changeSetVersion is greater than the last recorded one, or (c) the bean’s checksum is non-null and differs from the last recorded checksum in ChangeSetRecord. It also compares each change set’s dbToVersion against the stored DatabaseVersion.
-- Locking: A distributed lock (Mongo‑backed Sherlock) is acquired per realm before applying change sets to prevent concurrent execution.
+- Locking: A distributed lock (Mongo‑backed Sherlock) is acquired per realm for the whole migration call, for `quantum.database.migration.lock-duration`. If another call already holds it, the call fails with `MigrationInProgressException` ("A migration is already running for realm ...") rather than silently doing nothing.
+- Declared indexes: every migration call (`MigrationService#runAllUnRunMigrations`) ends by applying all declared model indexes (`applyAllIndexes`), including when no change sets are pending, so an index added only to a model annotation reaches realms that are already up to date. Every mapped entity is attempted; failures are collected and the call fails with `IndexBuildException` listing each failing collection. The database version has already been advanced by the change sets at that point, and the next migration call retries the index step. Indexes that exist but are no longer declared are reported as drift and left in place. This step runs on application startup, tenant provisioning (before seeding), and the `/initialize`, `/start`, and `/start/{realm}` endpoints. A startup migration logs an index failure and keeps starting; the endpoints report it as an error.
 - Transactions: Each change set runs within a MorphiaSession transaction; on success the change is recorded in ChangeSetRecord and DatabaseVersion is advanced (if higher). On failure the transaction is aborted and the error returned.
 - Realms: Migrations run per realm (Mongo database). A change set can optionally be restricted to certain database names or even override the realm it executes against (see below).
 
@@ -76,7 +79,8 @@ Required metadata methods:
 Execution method:
 
 - void execute(MorphiaSession session, MongoClient mongoClient, MultiEmitter<? super String> emitter)
-  - Perform your data/index changes using the provided session (transaction).
+  - Perform your data changes using the provided session (transaction).
+  - Do not call `ensureIndexes`: it applies the indexes models declare today, not those that existed when the change set was written, and the index step after migrations already applies them. Create an index explicitly only when your own data step needs it while running, or when dropping or replacing an index, and use a fixed definition whose name matches the model annotation. MongoDB does not build indexes on existing, non-empty collections inside a transaction, so do that through the `MongoClient` argument rather than the session.
   - Use emitter.emit("message") to stream log lines back to SSE clients.
 
 Optional targeting controls (provided by ChangeSetBase):
@@ -138,7 +142,7 @@ Security: Most endpoints require admin role; dbversion is PermitAll for introspe
   - Example:
     curl -N -H "Authorization: Bearer $TOKEN" http://localhost:8080/system/migration/start/my-realm
 
-SSE responses stream human‑readable messages produced by MigrationService and your change sets. The connection ends with "Task completed" or an error message.
+SSE responses stream human‑readable messages produced by MigrationService and your change sets. While a call runs, an SSE comment (`: migration running`) is sent every `quantum.database.migration.heartbeat-interval`. The connection ends with "Task completed" or an event starting with `Error:` (for example when an index cannot be built or another migration of the realm is running); deploy tooling should treat `Error:` as a failed migration.
 
 == Per‑entity index management (BaseResource)
 
@@ -156,6 +160,7 @@ Every entity resource that extends BaseResource<T, R extends BaseMorphiaRepo<T>>
 MigrationService also exposes programmatic index utilities used by the MigrationResource endpoints:
 
 - applyIndexes(realm): calls Morphia Datastore.applyIndexes() for the realm.
+- applyAllIndexes(realm[, emitter]): the post-migration index step described above; throws `IndexBuildException` when any entity's indexes cannot be applied, and reports undeclared indexes as drift.
 - dropAllIndexes(realm): iterates mapped entities and drops indexes on each underlying collection.
 
 == Validating versions at startup
@@ -169,7 +174,7 @@ MigrationService also exposes programmatic index utilities used by the Migration
 - Use SemVer consistently for from/to versions. The framework computes an integer form (e.g., 1.0.3 -> 103) for ordering.
 - Prefer small, focused change sets with clear descriptions and authorship.
 - Use the MultiEmitter in execute(...) to provide progress to operators consuming the SSE endpoint.
-- Apply new indexes with applyIndexes after deploying models with new @Indexed annotations; optionally dropAllIndexes then applyIndexes when changing index definitions across the board.
+- To add an index, declare it on the model; the next migration call creates it. To drop or change an index, write a change set that builds the replacement under a new name and drops the old one by name: the index step is additive and cannot change or remove an existing index.
 - Limit scope: use getApplicableDatabases() to constrain execution to specific databases, or isOverrideDatabase/getOverrideDatabaseName to target a different database when appropriate.
 
 === Checksum vs. from/to versions

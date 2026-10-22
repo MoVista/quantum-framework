@@ -46,7 +46,7 @@ public class ManagedSecretResource {
     @Path("{refName}")
     public Response get(@PathParam("refName") String refName) {
         String realmId = repo.getSecurityContextRealmId();
-        ManagedSecret secret = repo.findByRefName(realmId, refName)
+        ManagedSecret secret = repo.findByRefName(refName, realmId)
                 .orElseThrow(() -> new NotFoundException("Secret not found: " + refName));
         return Response.ok(toResponse(secret)).build();
     }
@@ -57,7 +57,7 @@ public class ManagedSecretResource {
             return Response.status(Response.Status.BAD_REQUEST).entity("refName is required").build();
         }
         String realmId = repo.getSecurityContextRealmId();
-        if (repo.findByRefName(realmId, request.getRefName()).isPresent()) {
+        if (repo.findByRefName(request.getRefName(), realmId).isPresent()) {
             return Response.status(Response.Status.CONFLICT).entity("Secret already exists: " + request.getRefName()).build();
         }
         ManagedSecret secret = new ManagedSecret();
@@ -73,7 +73,7 @@ public class ManagedSecretResource {
             return Response.status(Response.Status.BAD_REQUEST).build();
         }
         String realmId = repo.getSecurityContextRealmId();
-        ManagedSecret secret = repo.findByRefName(realmId, refName)
+        ManagedSecret secret = repo.findByRefName(refName, realmId)
                 .orElseThrow(() -> new NotFoundException("Secret not found: " + refName));
         apply(secret, request, false);
         repo.save(realmId, secret);

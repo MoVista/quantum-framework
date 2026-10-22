@@ -66,6 +66,13 @@
 
   <dependencies>
     <dependency>
+      <groupId>com.ibm.icu</groupId>
+      <artifactId>icu4j</artifactId>
+      <!-- MongoDB's English index collation reports ICU version 57.1. Keep its
+           Unicode comparison data aligned with application-side identity matching. -->
+      <version>57.1</version>
+    </dependency>
+    <dependency>
       <groupId>io.quarkus</groupId>
       <artifactId>quarkus-arc</artifactId>
     </dependency>

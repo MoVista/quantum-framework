@@ -16,6 +16,7 @@ import io.quarkus.test.junit.QuarkusTest;
 import jakarta.inject.Inject;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.wildfly.common.Assert;
 
@@ -24,6 +25,7 @@ import java.util.Set;
 
 
 @QuarkusTest
+@Disabled("Creates real users in an AWS Cognito user pool; needs AWS credentials and a region")
 public class TestCognitoAuthProvider extends BaseRepoTest{
    @ConfigProperty(name = "auth.provider")
    String authProvider;

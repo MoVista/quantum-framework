@@ -748,6 +748,8 @@ public class QueryGatewayResource {
             response.imported = result.getImported();
             response.failed = result.getFailed();
             return Response.ok(response).build();
+        } catch (BadRequestException e) {
+            throw e;
         } catch (Exception e) {
             Log.errorf(e, "Failed to commit import session %s for type %s", req.sessionId, req.rootType);
             Map<String, Object> error = new HashMap<>();

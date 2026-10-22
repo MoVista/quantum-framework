@@ -11,6 +11,8 @@ import com.e2eq.framework.util.SecurityUtils;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.security.TestSecurity;
 import jakarta.enterprise.context.control.ActivateRequestContext;
+import dev.morphia.DeleteOptions;
+import dev.morphia.query.filters.Filters;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -33,14 +35,27 @@ public class CheckEvalModeTest extends BaseRepoTest {
     @Inject
     SecurityUtils securityUtils;
 
+    private static final String SCOPED_POLICY = "scoped-policy";
+
     @AfterEach
     void clearContexts() {
         SecurityContext.clear();
+        removeScopedPolicy(testUtils.getTestRealm());
+        ruleContext.reloadFromRepo(testUtils.getTestRealm());
+    }
+
+    /** Every test installs the same policy, so each removes it again (directly; no rules apply). */
+    private void removeScopedPolicy(String realm) {
+        policyRepo.getMorphiaDataStoreWrapper().getDataStore(realm)
+                .find(Policy.class)
+                .filter(Filters.eq("refName", SCOPED_POLICY))
+                .delete(new DeleteOptions().multi(true));
     }
 
     private void installSimpleFilterAllowPolicy(String realm) {
+        removeScopedPolicy(realm);
         Policy p = new Policy();
-        p.setRefName("scoped-policy");
+        p.setRefName(SCOPED_POLICY);
         p.setDisplayName("Scoped Policy");
         p.setPrincipalId("user");
         p.setDataDomain(securityUtils.getSystemDataDomain());
