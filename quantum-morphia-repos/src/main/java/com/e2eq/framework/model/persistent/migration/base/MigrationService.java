@@ -155,6 +155,10 @@ public class MigrationService {
          () -> {
             try {
                runAllUnRunMigrations(realm, emitter);
+            } catch (MigrationInProgressException e) {
+               // Another replica or the deploy pipeline owns initialization. Request-time migration
+               // checks still reject work against an outdated realm until that run completes.
+               Log.warnf("Startup migration for realm %s is already running; continuing startup", realm);
             } catch (IndexBuildException e) {
                // Startup stays available; the deploy pipeline's migration call for this realm
                // fails on the same error, and every migration call retries the index step.

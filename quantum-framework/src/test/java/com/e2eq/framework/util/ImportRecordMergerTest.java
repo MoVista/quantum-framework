@@ -155,4 +155,63 @@ class ImportRecordMergerTest {
         assertThrows(IllegalArgumentException.class, () -> merger.merge(existing(), incoming, null));
         assertThrows(IllegalArgumentException.class, () -> merger.merge(existing(), incoming, List.of()));
     }
+    @Test
+    void dataDomainIsProtectedIncludingNestedColumns() {
+        Item incoming = new Item();
+        incoming.dataDomain = Map.of("ownerId", "attacker", "tenantId", "other");
+        for (String column : List.of("dataDomain", "dataDomain.ownerId", "dataDomain.tenantId")) {
+            assertEquals(Map.of("ownerId", "owner@a.example"),
+                    merger.merge(existing(), incoming, List.of(column)).dataDomain);
+        }
+    }
+
+    @Test
+    void inheritedTagsArrayIsReplacedRatherThanAppended() {
+        com.e2eq.framework.test.CSVModel current = new com.e2eq.framework.test.CSVModel();
+        current.setTags(new String[]{"old-tag"});
+        com.e2eq.framework.test.CSVModel incoming = new com.e2eq.framework.test.CSVModel();
+        incoming.setTags(new String[]{"new-tag"});
+        merger.merge(current, incoming, List.of("tags[0]"));
+        org.junit.jupiter.api.Assertions.assertArrayEquals(new String[]{"new-tag"}, current.getTags());
+        merger.merge(current, incoming, List.of("tags[0]"));
+        org.junit.jupiter.api.Assertions.assertArrayEquals(new String[]{"new-tag"}, current.getTags());
+    }
+
+    public static class ThreeCoordinates {
+        public Coord first;
+        public Coord second;
+        public Coord third;
+    }
+
+    @Test
+    void clearsAllThreeIndependentBlankObjects() {
+        ThreeCoordinates current = new ThreeCoordinates();
+        current.first = new Coord();
+        current.second = new Coord();
+        current.third = new Coord();
+        for (Coord coord : List.of(current.first, current.second, current.third)) {
+            coord.setLatitude(1.0);
+            coord.setLongitude(2.0);
+        }
+        merger.merge(current, new ThreeCoordinates(), List.of(
+                "first.latitude", "second.latitude", "third.latitude"));
+        assertNull(current.first);
+        assertNull(current.second);
+        assertNull(current.third);
+    }
+
+    public static class ArrayItem {
+        public int[] values;
+    }
+
+    @Test
+    void otherArrayTypesAlsoReplace() {
+        ArrayItem current = new ArrayItem();
+        current.values = new int[]{1, 2};
+        ArrayItem incoming = new ArrayItem();
+        incoming.values = new int[]{3};
+        merger.merge(current, incoming, List.of("values[0]"));
+        org.junit.jupiter.api.Assertions.assertArrayEquals(new int[]{3}, current.values);
+    }
+
 }

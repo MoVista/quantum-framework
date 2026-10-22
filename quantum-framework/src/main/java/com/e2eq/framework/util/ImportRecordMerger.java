@@ -8,6 +8,12 @@ import com.fasterxml.jackson.databind.exc.InvalidDefinitionException;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.NullNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.fasterxml.jackson.databind.module.SimpleModule;
+import com.fasterxml.jackson.databind.deser.BeanDeserializerModifier;
+import com.fasterxml.jackson.databind.deser.std.DelegatingDeserializer;
+import com.fasterxml.jackson.databind.JsonDeserializer;
+import com.fasterxml.jackson.databind.DeserializationConfig;
+import com.fasterxml.jackson.databind.type.ArrayType;
 
 import java.io.IOException;
 import java.util.Collection;
@@ -31,13 +37,13 @@ import java.util.Set;
  *       nested property. An indexed path ({@code tags[0]}) replaces the whole collection.</li>
  *   <li>Identity and system-managed properties are never copied: {@code id}, {@code refName}
  *       (the existing spelling is kept, since other documents' references copy it),
- *       {@code version}, and {@code auditInfo}.</li>
+ *       {@code version}, {@code dataDomain}, and {@code auditInfo}.</li>
  * </ul>
  */
 public final class ImportRecordMerger {
 
     private static final Set<String> PROTECTED_ROOTS = Set.of(
-            "id", "_id", "refName", "version", "auditInfo",
+            "id", "_id", "refName", "version", "auditInfo", "dataDomain",
             "actionList", "modelSourceRealm", "skipValidation", "defaultUIActions");
 
     private static final List<Class<?>> REPLACED_CONTAINER_TYPES = List.of(
@@ -65,8 +71,34 @@ public final class ImportRecordMerger {
         for (Class<?> type : REPLACED_CONTAINER_TYPES) {
             deepMerge.configOverride(type).setMergeable(Boolean.FALSE);
         }
+        SimpleModule arrays = new SimpleModule("import-array-replacement");
+        arrays.setDeserializerModifier(new BeanDeserializerModifier() {
+            @Override
+            public JsonDeserializer<?> modifyArrayDeserializer(DeserializationConfig config,
+                    ArrayType type, com.fasterxml.jackson.databind.BeanDescription bean,
+                    JsonDeserializer<?> deserializer) {
+                return new ReplacingArrayDeserializer(deserializer);
+            }
+        });
+        deepMerge.registerModule(arrays);
         this.shallowMerge = objectMapper.copy()
                 .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
+    }
+
+    private static final class ReplacingArrayDeserializer extends DelegatingDeserializer {
+        private ReplacingArrayDeserializer(JsonDeserializer<?> delegate) {
+            super(delegate);
+        }
+
+        @Override
+        protected JsonDeserializer<?> newDelegatingInstance(JsonDeserializer<?> delegate) {
+            return new ReplacingArrayDeserializer(delegate);
+        }
+
+        @Override
+        public Boolean supportsUpdate(DeserializationConfig config) {
+            return Boolean.FALSE;
+        }
     }
 
     /**
@@ -110,7 +142,7 @@ public final class ImportRecordMerger {
         if (blankObjects.isEmpty()) {
             return;
         }
-        for (int attempt = 0; attempt <= blankObjects.size(); attempt++) {
+        while (!blankObjects.isEmpty()) {
             Object trial;
             try {
                 trial = source.convertValue(existing, existing.getClass());

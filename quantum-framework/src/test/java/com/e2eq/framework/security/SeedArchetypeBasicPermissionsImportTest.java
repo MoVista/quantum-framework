@@ -15,6 +15,12 @@ import jakarta.enterprise.context.control.ActivateRequestContext;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
 
+import com.e2eq.framework.security.runtime.SecuritySession;
+import org.bson.types.ObjectId;
+
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -39,15 +45,21 @@ public class SeedArchetypeBasicPermissionsImportTest extends BaseRepoTest {
         assertTrue(res.performedWrites, "Seeder should perform writes in test mode");
 
         // Verify credentials and profiles for the three users defined in the seed
-        checkUser(realm, "test-user@end2endlogic.com");
-        checkUser(realm, "power-user@end2endlogic.com");
-        checkUser(realm, "tenant-admin@end2endlogic.com");
+        Map<String, ObjectId> profileIds = new LinkedHashMap<>();
+        for (String userId : List.of("test-user@end2endlogic.com",
+                "power-user@end2endlogic.com", "tenant-admin@end2endlogic.com")) {
+            profileIds.put(userId, checkUser(realm, userId).getId());
+        }
+
+        // Reimporting must update the same profiles, with no new identity collisions.
+        ArchetypeSeeder.importArchetype("basic-permissions-v1-test", realm, dd, true);
+        profileIds.forEach((userId, id) -> assertEquals(id, checkUser(realm, userId).getId()));
 
         // Rule context should be able to reload without throwing (policies loaded)
         ruleContext.reloadFromRepo(realm);
     }
 
-    private void checkUser(String realm, String userId) {
+    private UserProfile checkUser(String realm, String userId) {
         // Establish a principal context aligned with repository rule filters, which commonly scope credentials
         // under the system tenant/org/account. This ensures read access during test verification.
         // Use the target tenant for verification to satisfy repository filters
@@ -65,7 +77,6 @@ public class SeedArchetypeBasicPermissionsImportTest extends BaseRepoTest {
                 .withDataDomain(systemScoped)
                 .withScope("api")
                 .build();
-        com.e2eq.framework.model.securityrules.SecurityContext.setPrincipalContext(pc);
         // Also set a resource context so repository rule filters that depend on it are satisfied
         com.e2eq.framework.model.securityrules.ResourceContext rc = new com.e2eq.framework.model.securityrules.ResourceContext.Builder()
                 .withRealm(realm)
@@ -74,16 +85,17 @@ public class SeedArchetypeBasicPermissionsImportTest extends BaseRepoTest {
                 .withAction("view")
                 .withOwnerId(pc.getUserId())
                 .build();
-        com.e2eq.framework.model.securityrules.SecurityContext.setResourceContext(rc);
-        Optional<CredentialUserIdPassword> oc = credentialRepo.findByUserId(userId, testUtils.getSystemRealm(), true);
-        assertTrue(oc.isPresent(), () -> "Missing credential for " + userId);
-        Optional<UserProfile> op = userProfileRepo.getByUserId(realm, userId);
-        assertTrue(op.isPresent(), () -> "Missing user profile for " + userId);
-        // ownerId should equal the userId in the seeded profile's data domain if present
-        if (op.get().getDataDomain() != null) {
-            assertTrue(userId.equalsIgnoreCase(op.get().getDataDomain().getOwnerId()), "ownerId should equal userId for seeded profile");
+        try (SecuritySession ignored = new SecuritySession(pc, rc)) {
+            Optional<CredentialUserIdPassword> oc = credentialRepo.findByUserId(userId, testUtils.getSystemRealm(), true);
+            assertTrue(oc.isPresent(), () -> "Missing credential for " + userId);
+            Optional<UserProfile> op = userProfileRepo.getByUserId(realm, userId);
+            assertTrue(op.isPresent(), () -> "Missing user profile for " + userId);
+            assertEquals(userId, op.get().getRefName(), "Each seeded profile has its user's reference");
+            // ownerId should equal the userId in the seeded profile's data domain if present
+            if (op.get().getDataDomain() != null) {
+                assertTrue(userId.equalsIgnoreCase(op.get().getDataDomain().getOwnerId()), "ownerId should equal userId for seeded profile");
+            }
+            return op.get();
         }
-        com.e2eq.framework.model.securityrules.SecurityContext.clearPrincipalContext();
-        com.e2eq.framework.model.securityrules.SecurityContext.clearResourceContext();
     }
 }

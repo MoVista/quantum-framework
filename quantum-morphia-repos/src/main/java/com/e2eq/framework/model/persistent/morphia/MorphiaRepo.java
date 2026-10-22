@@ -346,6 +346,7 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
 
         List<Filter> filters = new ArrayList<>();
         filters.add(Filters.eq("refName", refName));
+        addSharedReferenceTenantFilter(datastore, filters);
         // Add filters based upon rule and resourceContext;
        Filter[] qfilters = new Filter[1];;
        if (!ignoreRules) {
@@ -369,6 +370,19 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
         return Optional.ofNullable(obj);
     }
 
+    /** Reference identity in the shared system database is scoped to the calling tenant. */
+    private void addSharedReferenceTenantFilter(Datastore datastore, List<Filter> filters) {
+        if (!com.e2eq.framework.model.security.Realm.class.equals(getPersistentClass())
+                && envConfigUtils != null && envConfigUtils.getSystemRealm().equals(datastore.getDatabase().getName())) {
+            String tenantId = SecurityContext.getPrincipalContext()
+                    .map(PrincipalContext::getDataDomain).map(DataDomain::getTenantId).orElse(null);
+            if (tenantId == null) {
+                throw new IllegalStateException("A tenant context is required for a shared-database reference lookup");
+            }
+            filters.add(Filters.eq("dataDomain.tenantId", tenantId));
+        }
+    }
+
     /**
      * Chooses one document when a reference lookup matches more than one. The reference-identity
      * index allows one document per reference per tenant, so several matches mean a collection
@@ -387,6 +401,7 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
                 .map(DataDomain::getTenantId)
                 .orElse(null);
         List<T> candidates = matches;
+        Filter[] selectedFilters = filters;
         if (tenantId != null) {
             Filter[] tenantFilters = Arrays.copyOf(filters, filters.length + 1);
             tenantFilters[filters.length] = Filters.eq("dataDomain.tenantId", tenantId);
@@ -395,16 +410,17 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
                     new FindOptions().collation(RefNameMatching.COLLATION).limit(2));
             if (!tenantMatches.isEmpty()) {
                 candidates = tenantMatches;
+                selectedFilters = tenantFilters;
             }
         }
         if (candidates.size() > 1 && tenantId != null && candidates != matches) {
             Log.warnf("Reference %s matches more than one %s in tenant %s of %s; duplicates must be reconciled",
                     refName, getPersistentClass().getSimpleName(), tenantId, datastore.getDatabase().getName());
         }
-        return candidates.stream()
-                .filter(candidate -> refName.equals(candidate.getRefName()))
-                .findFirst()
-                .orElse(candidates.get(0));
+        // The exact spelling can occur beyond the two rows used to detect ambiguity.
+        T exact = datastore.find(getPersistentClass()).filter(combineForMorphiaQuery(selectedFilters))
+                .first(new FindOptions().collation(com.mongodb.client.model.Collation.builder().locale("simple").build()));
+        return exact != null ? exact : candidates.get(0);
     }
 
 
@@ -1019,6 +1035,7 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
         filters = securityFilterBuilder().buildSecuredFilters(filters, getPersistentClass());
 
         filters.add(Filters.in("refName", refNames));
+        addSharedReferenceTenantFilter(datastore, filters);
 
         // Compare like the reference-identity unique index; returned refNames may differ in case
         // from the requested ones, so match results with RefNameMatching rather than equals().

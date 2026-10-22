@@ -52,4 +52,14 @@ class DuplicateReferenceRowsTest {
         assertTrue(rows.get(1).getErrors().isEmpty());
         assertTrue(rows.get(2).hasErrors());
     }
+    @Test
+    void sharpSAndDoubleSAreDistinctAtMongoEnglishSecondaryStrength() {
+        DuplicateReferenceRows rows = new DuplicateReferenceRows();
+        rows.record("strasse", 1);
+        rows.record("straße", 2);
+        assertTrue(rows.conflicts().isEmpty());
+        rows.record("STRAẞE", 3);
+        assertEquals(java.util.Set.of(2, 3), rows.conflicts().keySet());
+    }
+
 }

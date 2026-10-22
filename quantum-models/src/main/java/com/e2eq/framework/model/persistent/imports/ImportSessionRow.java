@@ -57,6 +57,9 @@ public class ImportSessionRow extends BaseModel {
     // JSON-serialized T (target entity)
     private String recordJson;
 
+    /** Exact row update mask after profile hooks; null for older/non-profile sessions. */
+    private java.util.List<String> importedColumns;
+
     // Original CSV line
     private String rawLine;
 

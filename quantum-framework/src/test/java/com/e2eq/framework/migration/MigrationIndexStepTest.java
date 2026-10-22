@@ -114,6 +114,22 @@ public class MigrationIndexStepTest extends BaseRepoTest {
         }
     }
 
+    @Test
+    public void startupContinuesWhenAnotherMigrationHoldsLock() throws Exception {
+        String realm = testUtils.getTestRealm();
+        DistributedLock lock = MongoSherlock.create(mongoClient.getDatabase("sherlock").getCollection("locks"))
+                .createLock(String.format("migration-lock-%s", realm));
+        assertTrue(lock.acquire(Duration.ofMinutes(1)));
+        try {
+            var method = MigrationService.class.getDeclaredMethod("migrateRealmSynchronously", String.class);
+            method.setAccessible(true);
+            org.junit.jupiter.api.Assertions.assertDoesNotThrow(() ->
+                    method.invoke(io.quarkus.arc.ClientProxy.unwrap(migrationService), realm));
+        } finally {
+            lock.release();
+        }
+    }
+
     private MongoCollection<Document> testModelCollection() {
         return collectionFor(UnversionedTestModel.class);
     }

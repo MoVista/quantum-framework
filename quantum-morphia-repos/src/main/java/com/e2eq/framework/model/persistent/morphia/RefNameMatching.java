@@ -3,7 +3,7 @@ package com.e2eq.framework.model.persistent.morphia;
 import com.mongodb.client.model.Collation;
 import com.mongodb.client.model.CollationStrength;
 
-import java.text.Collator;
+import com.ibm.icu.text.Collator;
 import java.util.Comparator;
 import java.util.Locale;
 import java.util.Map;
@@ -32,7 +32,7 @@ public final class RefNameMatching {
     }
 
     /**
-     * Returns a comparator equivalent to {@link #COLLATION}: references that differ only in case
+     * Returns a comparator using ICU English secondary comparison, as in {@link #COLLATION}: references that differ only in case
      * compare as equal; references that differ in accents do not. A new instance is returned on
      * every call because {@link Collator} is not thread-safe.
      *

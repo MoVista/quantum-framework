@@ -264,6 +264,197 @@ public class ReferenceImportBehaviorTest extends BaseRepoTest {
         }
     }
 
+
+    @Inject
+    com.e2eq.framework.persistent.RequiredImportModelRepo requiredRepo;
+
+    @Test
+    public void partialUpdatesValidateMergedDocumentInDirectAndBothPreviewPaths() throws IOException {
+        String ref = unique("Required");
+        try (final SecuritySession ignored = new SecuritySession(pContext, rContext)) {
+            var original = new com.e2eq.framework.test.RequiredImportModel();
+            original.setRefName(ref);
+            original.setRequiredValue("preserved");
+            requiredRepo.save(original);
+            String csv = "refName,displayName\n" + ref + ",Changed\n";
+            var direct = csvImportHelper.importCSV(requiredRepo, stream(csv), ',', '"', true, COLUMNS,
+                    StandardCharsets.UTF_8, false, "QUOTE_WHERE_ESSENTIAL", record -> { });
+            assertEquals(1, direct.getImportedCount(), direct.getRowResults().toString());
+            var plain = csvImportHelper.analyzeCSV(requiredRepo, stream(csv), ',', '"', true, COLUMNS,
+                    StandardCharsets.UTF_8, false, "QUOTE_WHERE_ESSENTIAL");
+            assertEquals(0, plain.getErrorRows());
+            assertEquals(1, csvImportHelper.commitImport(plain.getSessionId(), requiredRepo).getImported());
+            var profile = csvImportHelper.analyzeCSVWithProfile(requiredRepo, stream(csv), new ImportProfile(),
+                    COLUMNS, testUtils.getTestRealm());
+            assertEquals(0, profile.getErrorRows());
+            assertEquals(1, csvImportHelper.commitImport(profile.getSessionId(), requiredRepo).getImported());
+            assertEquals("preserved", requiredRepo.findByRefName(ref).orElseThrow().getRequiredValue());
+
+            // Unrelated invalid data is still checked on the merged document.
+            var ds = morphiaDataStoreWrapper.getDataStore(testUtils.getTestRealm());
+            var collection = ds.getDatabase().getCollection(ds.getMapper()
+                    .getEntityModel(com.e2eq.framework.test.RequiredImportModel.class).collectionName());
+            collection.updateOne(Filters.eq("refName", ref), new Document("$unset", new Document("requiredValue", "")));
+            var invalid = csvImportHelper.analyzeCSV(requiredRepo, stream(csv), ',', '"', true, COLUMNS,
+                    StandardCharsets.UTF_8, false, "QUOTE_WHERE_ESSENTIAL");
+            assertEquals(1, invalid.getErrorRows());
+            csvImportHelper.cancelImport(invalid.getSessionId());
+            var invalidDirect = csvImportHelper.importCSV(requiredRepo, stream(csv), ',', '"', true, COLUMNS,
+                    StandardCharsets.UTF_8, false, "QUOTE_WHERE_ESSENTIAL", record -> { });
+            assertEquals(1, invalidDirect.getErrorRows());
+            assertEquals(0, invalidDirect.getValidRows());
+            assertEquals(0, invalidDirect.getImportedCount());
+        } finally {
+            var ds = morphiaDataStoreWrapper.getDataStore(testUtils.getTestRealm());
+            ds.getDatabase().getCollection(ds.getMapper().getEntityModel(
+                    com.e2eq.framework.test.RequiredImportModel.class).collectionName()).deleteMany(Filters.eq("refName", ref));
+        }
+    }
+
+    @Test
+    public void profileComputedValuesPersistOnUpdateAndMasksArePerRow() throws IOException {
+        String first = unique("Computed");
+        String second = unique("Unchanged");
+        try (final SecuritySession ignored = new SecuritySession(pContext, rContext)) {
+            saveModel(first, "Original", "keep-first");
+            saveModel(second, "Original", "keep-second");
+            ImportProfile profile = new ImportProfile();
+            profile.setPreValidationTransformerNames(List.of("pr33-row-mask"));
+            profile.setInlineCalculators(List.of(com.e2eq.framework.model.persistent.imports.InlineFieldCalculator.builder()
+                    .fieldName("displayName")
+                    .type(com.e2eq.framework.model.persistent.imports.InlineFieldCalculator.CalculationType.STATIC)
+                    .staticValue("Calculated").build()));
+            var preview = csvImportHelper.analyzeCSVWithProfile(repo,
+                    stream("refName,testField3\n" + first + ",one\n" + second + ",two\n"), profile,
+                    List.of("refName", "testField3"), testUtils.getTestRealm());
+            assertEquals(0, preview.getErrorRows());
+            ImportSessionRow staged = importSessionRowRepo.findByRefName(
+                    ImportSessionRow.stagingRefName(preview.getSessionId(), 1)).orElseThrow();
+            assertTrue(staged.getImportedColumns().contains("displayName"));
+            assertFalse(staged.getImportedColumns().contains("testField"));
+            assertTrue(staged.getImportedColumns().contains("numberField"));
+            ImportSessionRow secondStaged = importSessionRowRepo.findByRefName(
+                    ImportSessionRow.stagingRefName(preview.getSessionId(), 2)).orElseThrow();
+            assertFalse(secondStaged.getImportedColumns().contains("numberField"));
+
+            // A value not supplied or changed by hooks must retain edits made after preview.
+            CSVModel edited = repo.findByRefName(first).orElseThrow();
+            edited.setTestField("changed-after-preview");
+            repo.save(edited);
+            assertEquals(2, csvImportHelper.commitImport(preview.getSessionId(), repo).getImported());
+            assertEquals("Calculated", repo.findByRefName(first).orElseThrow().getDisplayName());
+            assertEquals("changed-after-preview", repo.findByRefName(first).orElseThrow().getTestField());
+            assertEquals("keep-second", repo.findByRefName(second).orElseThrow().getTestField());
+            assertEquals(0, repo.findByRefName(first).orElseThrow().getNumberField());
+            assertEquals(7, repo.findByRefName(second).orElseThrow().getNumberField());
+        } finally {
+            deleteByRefPattern(first);
+            deleteByRefPattern(second);
+        }
+    }
+
+    @Test
+    public void importNeverUpdatesAnotherTenantsOnlyMatch() {
+        String ref = unique("Foreign");
+        try (final SecuritySession ignored = new SecuritySession(pContext, rContext)) {
+            CSVModel other = saveModel(ref, "Foreign original", "untouched");
+            collection().updateOne(Filters.eq("_id", other.getId()),
+                    new Document("$set", new Document("dataDomain.tenantId", "foreign-tenant")));
+            var imported = importCsv(ref + ",Own record\n");
+            assertEquals(1, imported.getInsertCount());
+            assertEquals(0, imported.getUpdateCount());
+            assertEquals("Foreign original", collection().find(Filters.eq("_id", other.getId())).first().getString("displayName"));
+            assertEquals(2, collection().countDocuments(refFilter(ref)));
+            var updated = importCsv(ref + ",Own changed\n");
+            assertEquals(1, updated.getUpdateCount());
+            assertEquals("Foreign original", collection().find(Filters.eq("_id", other.getId())).first().getString("displayName"));
+        } finally {
+            deleteByRefPattern(ref);
+        }
+    }
+
+    @Test
+    public void sharedDatabaseReferenceQueriesRequireTheCallersTenant() {
+        String ref = unique("SharedScope");
+        try (final SecuritySession ignored = new SecuritySession(pContext, rContext)) {
+            var ds = morphiaDataStoreWrapper.getDataStore(testUtils.getSystemRealm());
+            CSVModel foreign = new CSVModel();
+            foreign.setRefName(ref);
+            foreign.setDataDomain(DataDomain.builder().tenantId("foreign.example")
+                    .orgRefName(pContext.getDataDomain().getOrgRefName())
+                    .accountNum(pContext.getDataDomain().getAccountNum())
+                    .ownerId(pContext.getDataDomain().getOwnerId()).build());
+            ds.save(foreign);
+            assertTrue(repo.findByRefName(ds, ref, true).isEmpty());
+            assertTrue(repo.getListFromRefNames(ds, List.of(ref)).isEmpty());
+            CSVModel own = new CSVModel();
+            own.setRefName(ref);
+            own.setDataDomain(pContext.getDataDomain());
+            ds.save(own);
+            assertEquals(own.getId(), repo.findByRefName(ds, ref, true).orElseThrow().getId());
+            assertEquals(List.of(own.getId()), repo.getListFromRefNames(ds, List.of(ref)).stream()
+                    .map(CSVModel::getId).toList());
+        } finally {
+            var ds = morphiaDataStoreWrapper.getDataStore(testUtils.getSystemRealm());
+            ds.getDatabase().getCollection(ds.getMapper().getEntityModel(CSVModel.class).collectionName())
+                    .deleteMany(Filters.eq("refName", ref));
+        }
+    }
+
+    @Test
+    public void exactCaseLookupConsidersLegacyMatchesBeyondFirstTwo() {
+        String ref = unique("Legacy");
+        String realm = "legacy-lookup-" + UUID.randomUUID();
+        try (final SecuritySession ignored = new SecuritySession(pContext, rContext)) {
+            var ds = new MorphiaDatastore(mongoClient, dev.morphia.config.ManualMorphiaConfig.configure()
+                    .database(realm).applyIndexes(false));
+            ds.getMapper().map(CSVModel.class);
+            List<CSVModel> documents = new ArrayList<>();
+            for (String spelling : List.of(ref.toLowerCase(), ref, ref.toUpperCase())) {
+                CSVModel model = new CSVModel();
+                model.setRefName(spelling);
+                model.setDataDomain(pContext.getDataDomain());
+                documents.add(ds.save(model));
+            }
+            assertEquals(documents.get(2).getId(),
+                    repo.findByRefName(ds, ref.toUpperCase(), true).orElseThrow().getId());
+        } finally {
+            mongoClient.getDatabase(realm).drop();
+        }
+    }
+
+    @Test
+    public void unicodeReferenceComparisonAgreesWithMongo() {
+        String prefix = unique("Unicode");
+        try (final SecuritySession ignored = new SecuritySession(pContext, rContext)) {
+            var result = importCsv(prefix + "-strasse,Double S\n" + prefix + "-straße,Sharp S\n");
+            assertEquals(2, result.getImportedCount());
+            assertEquals(1, repo.getListFromRefNames(List.of(prefix + "-STRASSE")).size());
+            assertEquals(1, repo.getListFromRefNames(List.of(prefix + "-STRAẞE")).size());
+        } finally {
+            collection().deleteMany(Filters.regex("refName", "^" + Pattern.quote(prefix)));
+        }
+    }
+
+    @Test
+    public void duplicatesAcrossBatchBoundaryAreBothRejectedBeforeSaving() {
+        String prefix = unique("Batches");
+        StringBuilder rows = new StringBuilder();
+        for (int i = 0; i < 1001; i++) {
+            rows.append(prefix).append('-').append(i == 1000 ? 0 : i).append(",Row\n");
+        }
+        try (final SecuritySession ignored = new SecuritySession(pContext, rContext)) {
+            var result = importCsv(rows.toString());
+            assertEquals(999, result.getImportedCount());
+            assertEquals(2, result.getFailedCount());
+            assertEquals(0, collection().countDocuments(Filters.eq("refName", prefix + "-0")));
+            assertEquals(List.of(1, 1001), result.getRowResults().stream()
+                    .map(CSVImportHelper.ImportRowResult::getRowNumber).sorted().toList());
+        } finally {
+            collection().deleteMany(Filters.regex("refName", "^" + Pattern.quote(prefix)));
+        }
+    }
+
     private CSVImportHelper.ImportResult<CSVModel> importCsv(String rows) {
         return csvImportHelper.importCSV(repo, stream("refName,displayName\n" + rows), ',', '"', true, COLUMNS,
                 StandardCharsets.UTF_8, false, "QUOTE_WHERE_ESSENTIAL", record -> { });

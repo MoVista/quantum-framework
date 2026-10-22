@@ -27,7 +27,21 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** {@link ExcludeInheritedIndexes} is honored by every framework path that creates declared indexes. */
 @QuarkusTest
+@io.quarkus.test.junit.TestProfile(DeclaredIndexesTest.AutomaticIndexesProfile.class)
 public class DeclaredIndexesTest {
+
+    public static class AutomaticIndexesProfile implements io.quarkus.test.junit.QuarkusTestProfile {
+        @Override
+        public java.util.Map<String, String> getConfigOverrides() {
+            return java.util.Map.of(
+                    "quarkus.morphia.create-indexes", "true",
+                    "quarkus.morphia.database", "pr33-auto-index-base",
+                    "quarkus.morphia.packages", "com.e2eq.framework.model.persistent,com.e2eq.framework.test");
+        }
+    }
+
+    @Inject
+    MorphiaDatastore baseDatastore;
 
     @Inject
     MorphiaDataStoreWrapper morphiaDataStoreWrapper;
@@ -42,7 +56,13 @@ public class DeclaredIndexesTest {
     public void excludedInheritedIndexesAreLeftOutAndOwnIndexesApplied() {
         String realm = "declared-indexes-test-" + UUID.randomUUID().toString().substring(0, 8);
         try {
+            Set<String> baseIndexes = indexNames(collection(baseDatastore, ExcludedIndexTestModel.class));
+            assertTrue(baseIndexes.contains(ExcludedIndexTestModel.OWN_INDEX), baseIndexes.toString());
+            assertFalse(baseIndexes.contains(UnversionedBaseModel.REF_NAME_TENANT_UNIQUE_INDEX), baseIndexes.toString());
             MorphiaDatastore datastore = morphiaDataStoreWrapper.getDataStore(realm);
+            Set<String> automatic = indexNames(collection(datastore, ExcludedIndexTestModel.class));
+            assertTrue(automatic.contains(ExcludedIndexTestModel.OWN_INDEX), automatic.toString());
+            assertFalse(automatic.contains(UnversionedBaseModel.REF_NAME_TENANT_UNIQUE_INDEX), automatic.toString());
             datastore.getMapper().map(ExcludedIndexTestModel.class);
 
             DeclaredIndexes.ensure(datastore, ExcludedIndexTestModel.class);
@@ -66,6 +86,7 @@ public class DeclaredIndexesTest {
                     DeclaredIndexes.names(indexHelper, datastore.getMapper().getEntityModel(ExcludedIndexTestModel.class)));
         } finally {
             mongoClient.getDatabase(realm).drop();
+            mongoClient.getDatabase("pr33-auto-index-base").drop();
         }
     }
 

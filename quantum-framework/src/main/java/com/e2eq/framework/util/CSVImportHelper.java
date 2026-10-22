@@ -18,6 +18,13 @@ import com.e2eq.framework.model.persistent.morphia.BaseMorphiaRepo;
 import com.e2eq.framework.model.persistent.morphia.ImportSessionRepo;
 import com.e2eq.framework.model.persistent.morphia.RefNameMatching;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.e2eq.framework.model.persistent.base.DataDomain;
+import com.e2eq.framework.model.securityrules.PrincipalContext;
+import com.e2eq.framework.model.securityrules.SecurityContext;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.validation.ConstraintViolation;
@@ -245,6 +252,10 @@ public class CSVImportHelper {
         private final List<FieldError> errors = new ArrayList<>();
         @Setter
         private T record; // optional reference for debugging
+        /** Per-row paths written by profile processing, including the supplied CSV columns. */
+        @Setter
+        @com.fasterxml.jackson.annotation.JsonIgnore
+        private List<String> importedColumns;
 
         public boolean hasErrors() {
             return !errors.isEmpty();
@@ -524,100 +535,86 @@ public class CSVImportHelper {
         ImportResult<T> result = new ImportResult<>(0, 0);
         List<String> importedColumns = List.of(fieldMapping);
 
-        // Read and validate the whole file before saving anything: rows that share a reference
-        // are all rejected, which is only possible once every row has been seen.
-        List<T> validBeans = new ArrayList<>();
-        Map<T, Integer> rowNums = new IdentityHashMap<>();
-        Map<T, String> raws = new IdentityHashMap<>();
+        // Duplicate groups are known only at EOF. Spool parsed records instead of retaining the
+        // whole object graph, then replay non-conflicting rows in bounded batches.
         DuplicateReferenceRows references = new DuplicateReferenceRows();
-
-        int rowNum = 1; // first data row after header
-        while (true) {
-            T bean;
-            try {
-                bean = beanReader.read(repo.getPersistentClass(), processors);
-            } catch (Exception ex) {
-                String field = ex instanceof SuperCsvException ? resolveFieldFromParseException(ex, fieldMapping) : null;
-                ImportRowResult<T> rr = new ImportRowResult<>();
-                rr.setRowNumber(rowNum);
-                rr.setIntent(Intent.SKIP);
-                rr.setRawData(safeRaw(beanReader));
-                rr.getErrors().add(new FieldError(field, ex.getMessage(), FieldErrorCode.PARSE));
-
-                result.incrementTotalRows();
-                result.incrementErrorRows();
-                result.incrementFailedCount();
-                result.getRowResults().add(rr);
-
-                rowNum++;
-                continue;
-            }
-
-            if (bean == null) break; // EOF
-
-            result.incrementTotalRows();
-            references.record(bean.getRefName(), rowNum);
-
-            // Validate (collect, don't throw)
-            Set<jakarta.validation.ConstraintViolation<T>> violations = validator.validate(bean);
-            if (violations != null && !violations.isEmpty()) {
-                ImportRowResult<T> rr = new ImportRowResult<>();
-                rr.setRowNumber(rowNum);
-                rr.setRefName(bean.getRefName());
-                rr.setRawData(safeRaw(beanReader));
-
-                for (jakarta.validation.ConstraintViolation<T> v : violations) {
-                    rr.getErrors().add(new FieldError(
-                            v.getPropertyPath() != null ? v.getPropertyPath().toString() : null,
-                            v.getMessage(),
-                            FieldErrorCode.VALIDATION
-                    ));
+        Path spool = Files.createTempFile("quantum-csv-", ".jsonl");
+        ObjectMapper mapper = mapper();
+        try {
+            try (BufferedWriter writer = Files.newBufferedWriter(spool)) {
+                int rowNum = 1;
+                while (true) {
+                    T bean;
+                    try {
+                        bean = beanReader.read(repo.getPersistentClass(), processors);
+                    } catch (Exception ex) {
+                        ImportRowResult<T> rr = new ImportRowResult<>();
+                        rr.setRowNumber(rowNum++);
+                        rr.setRawData(safeRaw(beanReader));
+                        rr.getErrors().add(new FieldError(resolveFieldFromParseException(ex, fieldMapping),
+                                ex.getMessage(), FieldErrorCode.PARSE));
+                        result.incrementTotalRows();
+                        result.incrementErrorRows();
+                        result.incrementFailedCount();
+                        result.getRowResults().add(rr);
+                        continue;
+                    }
+                    if (bean == null) break;
+                    result.incrementTotalRows();
+                    references.record(bean.getRefName(), rowNum);
+                    ObjectNode row = mapper.createObjectNode();
+                    row.put("rowNumber", rowNum++);
+                    row.put("raw", safeRaw(beanReader));
+                    row.set("record", mapper.valueToTree(bean));
+                    writer.write(mapper.writeValueAsString(row));
+                    writer.newLine();
                 }
-                if (failedRecordHandler != null) failedRecordHandler.handleFailedRecord(bean);
-                result.incrementFailedCount();
-                result.incrementErrorRows();
-                result.getRowResults().add(rr);
-
-                rowNum++;
-                continue; // skip DB save
             }
 
-            validBeans.add(bean);
-            rowNums.put(bean, rowNum);
-            raws.put(bean, safeRaw(beanReader));
-            rowNum++;
-        }
-
-        Map<Integer, String> conflicts = references.conflicts();
-        List<T> batch = new ArrayList<>(BATCH_SIZE);
-        for (T bean : validBeans) {
-            String conflict = conflicts.get(rowNums.get(bean));
-            if (conflict != null) {
-                ImportRowResult<T> rr = new ImportRowResult<>();
-                rr.setRowNumber(rowNums.get(bean));
-                rr.setRefName(bean.getRefName());
-                rr.setRawData(raws.get(bean));
-                rr.getErrors().add(new FieldError("refName", conflict, FieldErrorCode.VALIDATION));
-                if (failedRecordHandler != null) failedRecordHandler.handleFailedRecord(bean);
-                result.incrementFailedCount();
-                result.incrementErrorRows();
-                result.getRowResults().add(rr);
-                continue;
+            Map<Integer, String> conflicts = references.conflicts();
+            List<T> batch = new ArrayList<>(BATCH_SIZE);
+            Map<T, Integer> rowNums = new IdentityHashMap<>();
+            Map<T, String> raws = new IdentityHashMap<>();
+            try (BufferedReader reader = Files.newBufferedReader(spool)) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    JsonNode row = mapper.readTree(line);
+                    T bean = mapper.treeToValue(row.get("record"), repo.getPersistentClass());
+                    int rowNum = row.get("rowNumber").asInt();
+                    rowNums.put(bean, rowNum);
+                    raws.put(bean, row.get("raw").asText(null));
+                    String conflict = conflicts.get(rowNum);
+                    if (conflict != null) {
+                        rejectRow(bean, failedRecordHandler, result, rowNums, raws, FieldErrorCode.VALIDATION, conflict);
+                        rowNums.remove(bean);
+                        raws.remove(bean);
+                        continue;
+                    }
+                    batch.add(bean);
+                    if (batch.size() >= BATCH_SIZE) {
+                        saveDirectBatch(repo, batch, failedRecordHandler, result, rowNums, raws, importedColumns);
+                        batch.clear();
+                        rowNums.clear();
+                        raws.clear();
+                    }
+                }
             }
-
-            result.incrementValidRows();
-            batch.add(bean);
-            if (batch.size() >= BATCH_SIZE) {
-                processBatch(repo, batch, failedRecordHandler, result, rowNums, raws, importedColumns);
-                batch.clear();
+            if (!batch.isEmpty()) {
+                saveDirectBatch(repo, batch, failedRecordHandler, result, rowNums, raws, importedColumns);
             }
-        }
-
-        if (!batch.isEmpty()) {
-            processBatch(repo, batch, failedRecordHandler, result, rowNums, raws, importedColumns);
+        } finally {
+            Files.deleteIfExists(spool);
         }
 
         return result;
+    }
+
+    private <T extends UnversionedBaseModel> void saveDirectBatch(
+            BaseMorphiaRepo<T> repo, List<T> batch, FailedRecordHandler<T> failedRecordHandler,
+            ImportResult<T> result, Map<T, Integer> rowNums, Map<T, String> raws, List<String> columns) {
+        int importedBefore = result.getImportedCount();
+        processBatch(repo, batch, failedRecordHandler, result, rowNums, raws, columns);
+        result.validRows += result.getImportedCount() - importedBefore;
     }
 
     public <T extends UnversionedBaseModel> ImportResult<T> preProcessBatch(
@@ -682,34 +679,43 @@ public class CSVImportHelper {
             Map<T, String> raws,
             List<String> importedColumns) {
 
+        return processBatch(repo, batch, failedRecordHandler, result, rowNums, raws, importedColumns, Map.of());
+    }
+
+    private <T extends UnversionedBaseModel> ImportResult<T> processBatch(
+            BaseMorphiaRepo<T> repo,
+            List<T> batch,
+            FailedRecordHandler<T> failedRecordHandler,
+            ImportResult<T> result,
+            Map<T, Integer> rowNums,
+            Map<T, String> raws,
+            List<String> importedColumns, Map<T, List<String>> rowColumns) {
+
         if (batch.isEmpty()) return result;
 
         Map<String, T> existing = findExistingByRefName(repo, batch);
-        boolean columnsKnown = importedColumns != null && !importedColumns.isEmpty();
         List<T> saved = new ArrayList<>(batch.size());
         List<T> toSave = new ArrayList<>(batch.size());
         int batchInserts = 0, batchUpdates = 0;
         for (T bean : batch) {
+            List<String> columns = rowColumns.getOrDefault(bean, importedColumns);
+            boolean columnsKnown = columns != null && !columns.isEmpty();
             T current = bean.getRefName() == null ? null : existing.get(bean.getRefName());
-            if (current == null) {
-                saved.add(bean);
-                toSave.add(bean);
-                batchInserts++;
-            } else if (!columnsKnown) {
+            if (current != null && !columnsKnown) {
                 rejectRow(bean, failedRecordHandler, result, rowNums, raws, FieldErrorCode.VALIDATION, format(
                         "Reference '%s' already exists, but this import does not record which columns it supplies, "
                                 + "so the existing record cannot be updated safely.", bean.getRefName()));
-            } else {
-                T merged;
-                try {
-                    merged = recordMerger().merge(current, bean, importedColumns);
-                } catch (IllegalArgumentException e) {
-                    rejectRow(bean, failedRecordHandler, result, rowNums, raws, FieldErrorCode.VALIDATION, e.getMessage());
-                    continue;
-                }
+                continue;
+            }
+            try {
+                T candidate = current == null ? bean : mergedCopy(current, bean, columns);
+                validateBean(candidate);
                 saved.add(bean);
-                toSave.add(merged);
-                batchUpdates++;
+                toSave.add(candidate);
+                if (current == null) batchInserts++;
+                else batchUpdates++;
+            } catch (Exception e) {
+                rejectRow(bean, failedRecordHandler, result, rowNums, raws, FieldErrorCode.VALIDATION, e.getMessage());
             }
         }
         if (toSave.isEmpty()) {
@@ -754,8 +760,8 @@ public class CSVImportHelper {
                 List<T> firstHalf = new ArrayList<>(saved.subList(0, midPoint));
                 List<T> secondHalf = new ArrayList<>(saved.subList(midPoint, saved.size()));
 
-                processBatch(repo, firstHalf, failedRecordHandler, result, rowNums, raws, importedColumns);
-                processBatch(repo, secondHalf, failedRecordHandler, result, rowNums, raws, importedColumns);
+                processBatch(repo, firstHalf, failedRecordHandler, result, rowNums, raws, importedColumns, rowColumns);
+                processBatch(repo, secondHalf, failedRecordHandler, result, rowNums, raws, importedColumns, rowColumns);
             }
         }
 
@@ -776,6 +782,16 @@ public class CSVImportHelper {
         result.incrementFailedCount();
         result.incrementErrorRows();
         result.getRowResults().add(rr);
+    }
+
+    private ObjectMapper mapper() {
+        return objectMapper != null ? objectMapper : new ObjectMapper();
+    }
+
+    @SuppressWarnings("unchecked")
+    private <T> T mergedCopy(T existing, T incoming, List<String> columns) {
+        T copy = (T) mapper().convertValue(existing, existing.getClass());
+        return recordMerger().merge(copy, incoming, columns);
     }
 
     private ImportRecordMerger recordMerger() {
@@ -802,9 +818,19 @@ public class CSVImportHelper {
         if (refNames.isEmpty()) {
             return existing;
         }
+        String tenant = SecurityContext.getPrincipalContext()
+                .map(PrincipalContext::getDataDomain).map(DataDomain::getTenantId).orElse(null);
         for (T found : repo.getListFromRefNames(refNames)) {
             if (found.getRefName() != null) {
-                existing.putIfAbsent(found.getRefName(), found);
+                if (tenant != null && (found.getDataDomain() == null
+                        || !tenant.equals(found.getDataDomain().getTenantId()))) {
+                    continue;
+                }
+                T previous = existing.putIfAbsent(found.getRefName(), found);
+                if (previous != null && !java.util.Objects.equals(previous.getId(), found.getId())) {
+                    throw new IllegalStateException("Ambiguous reference '" + found.getRefName()
+                            + "' in the importing tenant; reconcile duplicate records before importing");
+                }
             }
         }
         return existing;
@@ -887,7 +913,7 @@ public class CSVImportHelper {
 
                 if (batchBeans.size() >= BATCH_SIZE) {
                     List<ImportRowResult<T>> annotated = new ArrayList<>();
-                    annotateIntentsAndValidate(repo, batchBeans, batchRowNums, batchRawByRowNum, annotated, result);
+                    annotateIntentsAndValidate(repo, batchBeans, batchRowNums, batchRawByRowNum, annotated, result, requestedColumns);
                     stageAnnotatedRows(memMode, sessionId, annotated, memRows, result, references);
                     batchBeans.clear();
                     batchRowNums.clear();
@@ -899,7 +925,7 @@ public class CSVImportHelper {
 
             if (!batchBeans.isEmpty()) {
                 List<ImportRowResult<T>> annotated = new ArrayList<>();
-                annotateIntentsAndValidate(repo, batchBeans, batchRowNums, batchRawByRowNum, annotated, result);
+                annotateIntentsAndValidate(repo, batchBeans, batchRowNums, batchRawByRowNum, annotated, result, requestedColumns);
                 stageAnnotatedRows(memMode, sessionId, annotated, memRows, result, references);
             }
         } catch (IOException e) {
@@ -1085,7 +1111,7 @@ public class CSVImportHelper {
             List<Integer> batchRowNums,
             Map<Integer, String> rawByRowNum,          // <<< added
             List<ImportRowResult<T>> outRows,
-            ImportResult<T> aggregate) {
+            ImportResult<T> aggregate, List<String> importedColumns) {
 
         Map<String, T> existing = findExistingByRefName(repo, batchBeans);
 
@@ -1107,7 +1133,9 @@ public class CSVImportHelper {
 
             // validate
             try {
-                Set<ConstraintViolation<T>> violations = validator.validate(bean);
+                T current = bean.getRefName() == null ? null : existing.get(bean.getRefName());
+                Set<ConstraintViolation<T>> violations = validator.validate(current == null ? bean
+                        : mergedCopy(current, bean, importedColumns));
                 if (violations != null) {
                     for (ConstraintViolation<T> v : violations) {
                         rr.getErrors().add(new FieldError(
@@ -1138,14 +1166,18 @@ public class CSVImportHelper {
                 return new CommitResult(0, 0);
             }
             List<T> toSave = new ArrayList<>();
+            Map<T, List<String>> rowColumns = new IdentityHashMap<>();
             for (ImportRowResult<T> rr : session.getRows()) {
                 if (!rr.hasErrors() && (rr.getIntent() == Intent.INSERT || rr.getIntent() == Intent.UPDATE)) {
                     toSave.add(rr.getRecord());
+                    if (rr.getImportedColumns() != null && session.getImportedColumns() != null) {
+                        rowColumns.put(rr.getRecord(), rr.getImportedColumns());
+                    }
                 }
             }
             ImportResult<T> tmp = new ImportResult<>(0, 0);
             processBatch(repo, toSave, rec -> {
-            }, tmp, new IdentityHashMap<>(), new IdentityHashMap<>(), session.getImportedColumns());
+            }, tmp, new IdentityHashMap<>(), new IdentityHashMap<>(), session.getImportedColumns(), rowColumns);
             logFailedRows(sessionId, tmp);
             session.setStatus("COMMITTED");
             return new CommitResult(tmp.getImportedCount(), tmp.getFailedCount());
@@ -1173,6 +1205,7 @@ public class CSVImportHelper {
             if (page == null || page.isEmpty()) break;
             List<T> toSave = new ArrayList<>(page.size());
             Map<T, Integer> rowNums = new IdentityHashMap<>();
+            Map<T, List<String>> rowColumns = new IdentityHashMap<>();
             for (com.e2eq.framework.model.persistent.imports.ImportSessionRow r : page) {
                 if (r.getRecordJson() == null) {
                     tmp.incrementFailedCount();
@@ -1182,6 +1215,9 @@ public class CSVImportHelper {
                     T bean = objectMapper.readValue(r.getRecordJson(), repo.getPersistentClass());
                     toSave.add(bean);
                     rowNums.put(bean, r.getRowNumber());
+                    if (r.getImportedColumns() != null && session.getImportedColumns() != null) {
+                        rowColumns.put(bean, r.getImportedColumns());
+                    }
                 } catch (Exception ex) {
                     // the staged record can no longer be read as the target type
                     tmp.incrementFailedCount();
@@ -1189,7 +1225,7 @@ public class CSVImportHelper {
             }
             if (!toSave.isEmpty()) {
                 processBatch(repo, toSave, rec -> {
-                }, tmp, rowNums, new IdentityHashMap<>(), session.getImportedColumns());
+                }, tmp, rowNums, new IdentityHashMap<>(), session.getImportedColumns(), rowColumns);
             }
             skip += page.size();
         }
@@ -1364,106 +1400,15 @@ public class CSVImportHelper {
 
                 if (bean == null) break; // EOF
 
-                // Apply field calculators and row value resolvers if profile is set
-                if (profile != null && bean instanceof BaseModel baseModel) {
-                    ImportContext context = ImportContext.builder()
-                            .profile(profile)
-                            .targetClass(repo.getPersistentClass())
-                            .realmId(realmId)
-                            .rowNumber(rowNum)
-                            .sessionId(sessionId)
-                            .build();
-
-                    // Apply field calculators
-                    importProfileService.applyFieldCalculators(profile, baseModel, rowData, context);
-
-                    // Apply row value resolvers (arbitrary code per-column with full row access)
-                    com.e2eq.framework.imports.spi.RowValueResolver.ResolveResult resolverResult =
-                            importProfileService.applyRowValueResolvers(profile, baseModel, rowData, context);
-
-                    if (!resolverResult.isSuccess()) {
-                        ImportRowResult<T> rr = new ImportRowResult<>();
-                        rr.setRowNumber(rowNum);
-                        rr.setIntent(Intent.SKIP);
-                        rr.setRawData(safeRaw(beanReader));
-                        rr.getErrors().add(new FieldError(null, resolverResult.getErrorMessage(), FieldErrorCode.VALIDATION));
-                        persistOrStoreRow(memMode, sessionId, rr, memRows, result);
-                        rowNum++;
-                        continue;
-                    }
-
-                    if (resolverResult.isSkip()) {
-                        ImportRowResult<T> rr = new ImportRowResult<>();
-                        rr.setRowNumber(rowNum);
-                        rr.setIntent(Intent.SKIP);
-                        rr.setRawData(safeRaw(beanReader));
-                        result.incrementTotalRows();
-                        rowNum++;
-                        continue;
-                    }
-
-                    // Process dynamic attributes if enabled and model supports it
-                    if (dynamicAttrContext != null && baseModel instanceof DynamicAttributeSupport dynamicModel) {
-                        // Create full row data map including raw headers for dynamic attribute extraction
-                        Map<String, Object> fullRowData = new HashMap<>(rowData);
-                        // Also populate with raw header values for dynamic attribute columns
-                        String untokenized = beanReader.getUntokenizedRow();
-                        if (untokenized != null) {
-                            String[] rawValues = untokenized.split(String.valueOf(fieldSeparator), -1);
-                            for (int idx = 0; idx < Math.min(rawHeaders.length, rawValues.length); idx++) {
-                                fullRowData.put(rawHeaders[idx], rawValues[idx]);
-                            }
-                        }
-
-                        List<DynamicAttributeSet> existingSets = dynamicModel.getDynamicAttributeSets();
-                        List<DynamicAttributeSet> mergedSets = dynamicAttributeImportService.processRow(
-                                fullRowData, dynamicAttrContext, existingSets);
-                        dynamicModel.setDynamicAttributeSets(mergedSets);
-                    }
-
-                    // Apply pre-validation transformers
-                    PreValidationTransformer.TransformResult transformResult =
-                            importProfileService.applyPreValidationTransformers(profile, baseModel, rowData, context);
-
-                    if (!transformResult.isSuccess()) {
-                        ImportRowResult<T> rr = new ImportRowResult<>();
-                        rr.setRowNumber(rowNum);
-                        rr.setIntent(Intent.SKIP);
-                        rr.setRawData(safeRaw(beanReader));
-                        rr.getErrors().add(new FieldError(null, transformResult.getErrorMessage(), FieldErrorCode.VALIDATION));
-                        persistOrStoreRow(memMode, sessionId, rr, memRows, result);
-                        rowNum++;
-                        continue;
-                    }
-
-                    if (transformResult.isSkip()) {
-                        ImportRowResult<T> rr = new ImportRowResult<>();
-                        rr.setRowNumber(rowNum);
-                        rr.setIntent(Intent.SKIP);
-                        rr.setRawData(safeRaw(beanReader));
-                        // Skip is not an error, just don't process
-                        result.incrementTotalRows();
-                        rowNum++;
-                        continue;
-                    }
-                }
-
                 batchRawByRowNum.put(rowNum, safeRaw(beanReader));
                 batchRowDataByRowNum.put(rowNum, rowData);
                 batchBeans.add(bean);
                 batchRowNums.add(rowNum);
 
                 if (batchBeans.size() >= BATCH_SIZE) {
-                    List<ImportRowResult<T>> annotated = new ArrayList<>();
-                    if (applyBatchHandlersAndValidate(repo, batchBeans, batchRowNums,
-                            batchRawByRowNum, batchRowDataByRowNum, annotated, result, profile,
-                            realmId, sessionId)) {
-                        // Batch handler failed, annotated has errors
-                    } else {
-                        annotateIntentsAndValidateWithProfile(repo, batchBeans, batchRowNums,
-                                batchRawByRowNum, batchRowDataByRowNum, annotated, result, profile);
-                    }
-
+                    List<ImportRowResult<T>> annotated = processProfileBatch(repo, batchBeans, batchRowNums,
+                            batchRawByRowNum, batchRowDataByRowNum, result, profile, realmId, sessionId,
+                            effectiveColumns, rawHeaders, dynamicAttrContext, fieldSeparator);
                     stageAnnotatedRows(memMode, sessionId, annotated, memRows, result, references);
 
                     batchBeans.clear();
@@ -1477,16 +1422,9 @@ public class CSVImportHelper {
 
             // Process remaining batch
             if (!batchBeans.isEmpty()) {
-                List<ImportRowResult<T>> annotated = new ArrayList<>();
-                if (applyBatchHandlersAndValidate(repo, batchBeans, batchRowNums,
-                        batchRawByRowNum, batchRowDataByRowNum, annotated, result, profile,
-                        realmId, sessionId)) {
-                    // Batch handler failed, annotated has errors
-                } else {
-                    annotateIntentsAndValidateWithProfile(repo, batchBeans, batchRowNums,
-                            batchRawByRowNum, batchRowDataByRowNum, annotated, result, profile);
-                }
-
+                List<ImportRowResult<T>> annotated = processProfileBatch(repo, batchBeans, batchRowNums,
+                        batchRawByRowNum, batchRowDataByRowNum, result, profile, realmId, sessionId,
+                        effectiveColumns, rawHeaders, dynamicAttrContext, fieldSeparator);
                 stageAnnotatedRows(memMode, sessionId, annotated, memRows, result, references);
             }
         } catch (IOException e) {
@@ -1496,6 +1434,151 @@ public class CSVImportHelper {
         applyDuplicateReferenceErrors(references, memMode, sessionId, memRows, result);
         closeImportSession(memMode, session, sessionId, repo, memRows, result, importedColumns);
         return result;
+    }
+
+    /** Run profile hooks on merged copies, so partial UPDATE rows have their existing values.
+     * Track only fields supplied by the file or changed by hooks, independently for each row. */
+    private <T extends UnversionedBaseModel> List<ImportRowResult<T>> processProfileBatch(
+            BaseMorphiaRepo<T> repo, List<T> beans, List<Integer> rowNumbers,
+            Map<Integer, String> raw, Map<Integer, Map<String, Object>> rowData,
+            ImportResult<T> result, ImportProfile profile, String realmId, String sessionId,
+            List<String> columns, String[] rawHeaders,
+            DynamicAttributeImportService.RowContext dynamicAttrContext, char fieldSeparator) {
+        Map<String, T> existing = findExistingByRefName(repo, beans);
+        List<T> prepared = new ArrayList<>();
+        List<Integer> preparedNumbers = new ArrayList<>();
+        Map<T, JsonNode> beforeHooks = new IdentityHashMap<>();
+        List<ImportRowResult<T>> rows = new ArrayList<>();
+        for (int i = 0; i < beans.size(); i++) {
+            T bean = beans.get(i);
+            int number = rowNumbers.get(i);
+            ImportRowResult<T> rr = new ImportRowResult<>();
+            rr.setRowNumber(number);
+            rr.setRefName(bean.getRefName());
+            rr.setRawData(raw.get(number));
+            try {
+                T current = bean.getRefName() == null ? null : existing.get(bean.getRefName());
+                String requestedRef = bean.getRefName();
+                if (current != null) {
+                    bean = mergedCopy(current, bean, columns);
+                    // Row results retain the reference as supplied by the file.
+                    bean.setRefName(requestedRef);
+                }
+                beforeHooks.put(bean, mapper().valueToTree(bean));
+                rr.setRecord(bean);
+                if (!applyProfileToRow(repo, bean, rowData.get(number), profile, realmId,
+                        sessionId, rr, rawHeaders, dynamicAttrContext, fieldSeparator)) {
+                    rows.add(rr);
+                    continue;
+                }
+                prepared.add(bean);
+                preparedNumbers.add(number);
+            } catch (Exception e) {
+                rr.getErrors().add(new FieldError(null, e.getMessage(), FieldErrorCode.VALIDATION));
+                rows.add(rr);
+            }
+        }
+        List<ImportRowResult<T>> annotated = new ArrayList<>();
+        if (!applyBatchHandlersAndValidate(repo, prepared, preparedNumbers, raw, rowData,
+                annotated, result, profile, realmId, sessionId)) {
+            Map<T, List<String>> masks = new IdentityHashMap<>();
+            for (T bean : prepared) {
+                java.util.Set<String> mask = new java.util.LinkedHashSet<>(columns);
+                changedPaths(beforeHooks.get(bean), mapper().valueToTree(bean), "", mask);
+                masks.put(bean, List.copyOf(mask));
+            }
+            annotateIntentsAndValidateWithProfile(repo, prepared, preparedNumbers, raw, rowData,
+                    annotated, result, profile, masks);
+        }
+        rows.addAll(annotated);
+        return rows;
+    }
+
+    /** Arrays and collections are replacement values; object changes keep their leaf paths. */
+    private static void changedPaths(JsonNode before,
+            JsonNode after, String prefix, java.util.Set<String> paths) {
+        if (java.util.Objects.equals(before, after)) return;
+        if (before != null && after != null && before.isObject() && after.isObject()) {
+            java.util.Set<String> names = new java.util.LinkedHashSet<>();
+            before.fieldNames().forEachRemaining(names::add);
+            after.fieldNames().forEachRemaining(names::add);
+            for (String name : names) {
+                changedPaths(before.get(name), after.get(name), prefix.isEmpty() ? name : prefix + "." + name, paths);
+            }
+        } else if (!prefix.isEmpty()) {
+            paths.add(prefix);
+        }
+    }
+
+    private <T extends UnversionedBaseModel> boolean applyProfileToRow(
+            BaseMorphiaRepo<T> repo, T bean, Map<String, Object> rowData, ImportProfile profile,
+            String realmId, String sessionId, ImportRowResult<T> rr, String[] rawHeaders,
+            DynamicAttributeImportService.RowContext dynamicAttrContext, char fieldSeparator) {
+        int rowNum = rr.getRowNumber();
+        // Apply field calculators and row value resolvers if profile is set
+        if (profile != null && bean instanceof BaseModel baseModel) {
+            ImportContext context = ImportContext.builder()
+                    .profile(profile)
+                    .targetClass(repo.getPersistentClass())
+                    .realmId(realmId)
+                    .rowNumber(rowNum)
+                    .sessionId(sessionId)
+                    .build();
+
+            // Apply field calculators
+            importProfileService.applyFieldCalculators(profile, baseModel, rowData, context);
+
+            // Apply row value resolvers (arbitrary code per-column with full row access)
+            com.e2eq.framework.imports.spi.RowValueResolver.ResolveResult resolverResult =
+                    importProfileService.applyRowValueResolvers(profile, baseModel, rowData, context);
+
+            if (!resolverResult.isSuccess()) {
+                rr.setIntent(Intent.SKIP);
+                rr.getErrors().add(new FieldError(null, resolverResult.getErrorMessage(), FieldErrorCode.VALIDATION));
+                return false;
+            }
+
+            if (resolverResult.isSkip()) {
+                rr.setIntent(Intent.SKIP);
+                return false;
+            }
+
+            // Process dynamic attributes if enabled and model supports it
+            if (dynamicAttrContext != null && baseModel instanceof DynamicAttributeSupport dynamicModel) {
+                // Create full row data map including raw headers for dynamic attribute extraction
+                Map<String, Object> fullRowData = new HashMap<>(rowData);
+                // Also populate with raw header values for dynamic attribute columns
+                String untokenized = rr.getRawData();
+                if (untokenized != null) {
+                    String[] rawValues = untokenized.split(String.valueOf(fieldSeparator), -1);
+                    for (int idx = 0; idx < Math.min(rawHeaders.length, rawValues.length); idx++) {
+                        fullRowData.put(rawHeaders[idx], rawValues[idx]);
+                    }
+                }
+
+                List<DynamicAttributeSet> existingSets = dynamicModel.getDynamicAttributeSets();
+                List<DynamicAttributeSet> mergedSets = dynamicAttributeImportService.processRow(
+                        fullRowData, dynamicAttrContext, existingSets);
+                dynamicModel.setDynamicAttributeSets(mergedSets);
+            }
+
+            // Apply pre-validation transformers
+            PreValidationTransformer.TransformResult transformResult =
+                    importProfileService.applyPreValidationTransformers(profile, baseModel, rowData, context);
+
+            if (!transformResult.isSuccess()) {
+                rr.setIntent(Intent.SKIP);
+                rr.getErrors().add(new FieldError(null, transformResult.getErrorMessage(), FieldErrorCode.VALIDATION));
+                return false;
+            }
+
+            if (transformResult.isSkip()) {
+                rr.setIntent(Intent.SKIP);
+                return false;
+            }
+        }
+
+        return true;
     }
 
     /**
@@ -1616,6 +1699,7 @@ public class CSVImportHelper {
         row.setRefName(com.e2eq.framework.model.persistent.imports.ImportSessionRow.stagingRefName(sessionId, rowResult.getRowNumber()));
         row.setTargetRefName(rowResult.getRefName());
         row.setIntent(rowResult.getIntent().name());
+        row.setImportedColumns(rowResult.getImportedColumns());
         row.setHasErrors(rowResult.hasErrors());
         row.setRawLine(rowResult.getRawData());
         try {
@@ -1697,7 +1781,7 @@ public class CSVImportHelper {
             Map<Integer, Map<String, Object>> rowDataByRowNum,
             List<ImportRowResult<T>> outRows,
             ImportResult<T> aggregate,
-            ImportProfile profile) {
+            ImportProfile profile, Map<T, List<String>> rowColumns) {
 
         Map<String, T> existing = findExistingByRefName(repo, batchBeans);
 
@@ -1711,6 +1795,7 @@ public class CSVImportHelper {
             rr.setRowNumber(rn);
             rr.setRefName(bean.getRefName());
             rr.setRecord(bean);
+            rr.setImportedColumns(rowColumns.get(bean));
 
             // Determine intent from profile or default
             Intent intent;
@@ -1739,7 +1824,9 @@ public class CSVImportHelper {
 
             // Validate
             try {
-                Set<ConstraintViolation<T>> violations = validator.validate(bean);
+                T current = bean.getRefName() == null ? null : existing.get(bean.getRefName());
+                Set<ConstraintViolation<T>> violations = validator.validate(current == null ? bean
+                        : mergedCopy(current, bean, rowColumns.get(bean)));
                 if (violations != null) {
                     for (ConstraintViolation<T> v : violations) {
                         rr.getErrors().add(new FieldError(
