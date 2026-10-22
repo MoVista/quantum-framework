@@ -19,7 +19,6 @@ import com.e2eq.framework.model.persistent.morphia.ImportSessionRepo;
 import com.e2eq.framework.model.persistent.morphia.RefNameMatching;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.e2eq.framework.model.persistent.base.DataDomain;
 import com.e2eq.framework.model.securityrules.PrincipalContext;
 import com.e2eq.framework.model.securityrules.SecurityContext;
@@ -44,9 +43,11 @@ import org.supercsv.quote.AlwaysQuoteMode;
 import org.supercsv.quote.NormalQuoteMode;
 import org.supercsv.quote.QuoteMode;
 import org.supercsv.util.CsvContext;
+import org.bson.types.ObjectId;
 
 import java.io.*;
 import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -461,10 +462,10 @@ public class CSVImportHelper {
         ImportResult<T> result = new ImportResult<>(0, 0);
 
         try (Reader reader = makeReader(inputStream, charset, mustUseBOM)) {
-            ICsvDozerBeanReader beanReader = new CsvDozerBeanReader(reader,
-                    new CsvPreference.Builder(quoteChar, fieldSeparator, "\r\n")
-                            .useQuoteMode(getQuoteMode(quotingStrategy))
-                            .build());
+            CsvPreference preference = new CsvPreference.Builder(quoteChar, fieldSeparator, "\r\n")
+                    .useQuoteMode(getQuoteMode(quotingStrategy))
+                    .build();
+            ICsvDozerBeanReader beanReader = new CsvDozerBeanReader(reader, preference);
 
             String[] header = beanReader.getHeader(skipHeaderRow);
             if (skipHeaderRow && header == null) {
@@ -477,7 +478,7 @@ public class CSVImportHelper {
             ListCellProcessor listProcessor = new ListCellProcessor();
             CellProcessor[] processors = buildProcessors(repo.getPersistentClass(), requestedColumns, listProcessor);
 
-            result = importFlatProperty(repo, beanReader, processors, failedRecordHandler, fieldMapping);
+            result = importFlatProperty(repo, beanReader, preference, processors, failedRecordHandler, fieldMapping);
         } catch (IOException e) {
             throw new WebApplicationException("Error importing CSV: " + e.getMessage(), e, 400);
         }
@@ -528,6 +529,7 @@ public class CSVImportHelper {
     private <T extends UnversionedBaseModel> ImportResult<T> importFlatProperty(
             BaseMorphiaRepo<T> repo,
             ICsvDozerBeanReader beanReader,
+            CsvPreference preference,
             CellProcessor[] processors,
             FailedRecordHandler<T> failedRecordHandler,
             String[] fieldMapping) throws IOException {
@@ -535,13 +537,16 @@ public class CSVImportHelper {
         ImportResult<T> result = new ImportResult<>(0, 0);
         List<String> importedColumns = List.of(fieldMapping);
 
-        // Duplicate groups are known only at EOF. Spool parsed records instead of retaining the
-        // whole object graph, then replay non-conflicting rows in bounded batches.
+        // Duplicate groups are known only at EOF. Spool the raw CSV rows instead of retaining the
+        // whole object graph, then parse them again and save non-conflicting rows in bounded
+        // batches. Re-parsing builds each record exactly as the first pass did; a JSON round trip
+        // would drop @JsonIgnore values (a credential's password hash) and call setters that
+        // reject the nulls of columns the file omits.
         DuplicateReferenceRows references = new DuplicateReferenceRows();
-        Path spool = Files.createTempFile("quantum-csv-", ".jsonl");
-        ObjectMapper mapper = mapper();
+        List<Integer> spooledRows = new ArrayList<>();
+        Path spool = Files.createTempFile("quantum-csv-", ".csv");
         try {
-            try (BufferedWriter writer = Files.newBufferedWriter(spool)) {
+            try (BufferedWriter writer = Files.newBufferedWriter(spool, StandardCharsets.UTF_8)) {
                 int rowNum = 1;
                 while (true) {
                     T bean;
@@ -562,11 +567,8 @@ public class CSVImportHelper {
                     if (bean == null) break;
                     result.incrementTotalRows();
                     references.record(bean.getRefName(), rowNum);
-                    ObjectNode row = mapper.createObjectNode();
-                    row.put("rowNumber", rowNum++);
-                    row.put("raw", safeRaw(beanReader));
-                    row.set("record", mapper.valueToTree(bean));
-                    writer.write(mapper.writeValueAsString(row));
+                    spooledRows.add(rowNum++);
+                    writer.write(beanReader.getUntokenizedRow());
                     writer.newLine();
                 }
             }
@@ -575,14 +577,33 @@ public class CSVImportHelper {
             List<T> batch = new ArrayList<>(BATCH_SIZE);
             Map<T, Integer> rowNums = new IdentityHashMap<>();
             Map<T, String> raws = new IdentityHashMap<>();
-            try (BufferedReader reader = Files.newBufferedReader(spool)) {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    JsonNode row = mapper.readTree(line);
-                    T bean = mapper.treeToValue(row.get("record"), repo.getPersistentClass());
-                    int rowNum = row.get("rowNumber").asInt();
+            try (ICsvDozerBeanReader replay = new CsvDozerBeanReader(
+                    Files.newBufferedReader(spool, StandardCharsets.UTF_8), preference)) {
+                replay.configureBeanMapping(repo.getPersistentClass(), fieldMapping);
+                for (int rowNum : spooledRows) {
+                    T bean;
+                    String field = null;
+                    String error = "The row could not be read again from the spooled file.";
+                    try {
+                        bean = replay.read(repo.getPersistentClass(), processors);
+                    } catch (Exception ex) {
+                        bean = null;
+                        field = resolveFieldFromParseException(ex, fieldMapping);
+                        error = ex.getMessage();
+                    }
+                    if (bean == null) {
+                        // Parsed on the first pass, so not expected; earlier batches may already be
+                        // saved, so report the row rather than failing the whole request.
+                        ImportRowResult<T> rr = new ImportRowResult<>();
+                        rr.setRowNumber(rowNum);
+                        rr.getErrors().add(new FieldError(field, error, FieldErrorCode.PARSE));
+                        result.incrementErrorRows();
+                        result.incrementFailedCount();
+                        result.getRowResults().add(rr);
+                        continue;
+                    }
                     rowNums.put(bean, rowNum);
-                    raws.put(bean, row.get("raw").asText(null));
+                    raws.put(bean, safeRaw(replay));
                     String conflict = conflicts.get(rowNum);
                     if (conflict != null) {
                         rejectRow(bean, failedRecordHandler, result, rowNums, raws, FieldErrorCode.VALIDATION, conflict);
@@ -707,8 +728,17 @@ public class CSVImportHelper {
                                 + "so the existing record cannot be updated safely.", bean.getRefName()));
                 continue;
             }
+            if (current == null && bean.getId() != null) {
+                // Only an UPDATE may carry an identity; saving it as an insert would replace that document.
+                rejectRow(bean, failedRecordHandler, result, rowNums, raws, FieldErrorCode.VALIDATION, format(
+                        "Reference '%s' does not exist, but the row carries the id of another record.",
+                        bean.getRefName()));
+                continue;
+            }
             try {
-                T candidate = current == null ? bean : mergedCopy(current, bean, columns);
+                // Merge onto the freshly loaded document rather than a JSON copy: the API mapper
+                // omits persisted @JsonIgnore fields (for example a credential's password hash).
+                T candidate = current == null ? bean : recordMerger().merge(current, bean, columns);
                 validateBean(candidate);
                 saved.add(bean);
                 toSave.add(candidate);
@@ -722,6 +752,7 @@ public class CSVImportHelper {
             return result;
         }
 
+        List<T> unidentified = toSave.stream().filter(candidate -> candidate.getId() == null).toList();
         try {
             repo.save(toSave);
 
@@ -755,6 +786,8 @@ public class CSVImportHelper {
                         message != null ? message : "Database write failed.");
 
             } else {
+                // A failed save may have assigned ids to new records; retry them as inserts.
+                unidentified.forEach(candidate -> candidate.setId(null));
                 // Bisect to isolate failing records without losing successes
                 int midPoint = saved.size() / 2;
                 List<T> firstHalf = new ArrayList<>(saved.subList(0, midPoint));
@@ -1448,6 +1481,7 @@ public class CSVImportHelper {
         List<T> prepared = new ArrayList<>();
         List<Integer> preparedNumbers = new ArrayList<>();
         Map<T, JsonNode> beforeHooks = new IdentityHashMap<>();
+        Map<T, T> mergedOnto = new IdentityHashMap<>();
         List<ImportRowResult<T>> rows = new ArrayList<>();
         for (int i = 0; i < beans.size(); i++) {
             T bean = beans.get(i);
@@ -1463,6 +1497,7 @@ public class CSVImportHelper {
                     bean = mergedCopy(current, bean, columns);
                     // Row results retain the reference as supplied by the file.
                     bean.setRefName(requestedRef);
+                    mergedOnto.put(bean, current);
                 }
                 beforeHooks.put(bean, mapper().valueToTree(bean));
                 rr.setRecord(bean);
@@ -1488,7 +1523,7 @@ public class CSVImportHelper {
                 masks.put(bean, List.copyOf(mask));
             }
             annotateIntentsAndValidateWithProfile(repo, prepared, preparedNumbers, raw, rowData,
-                    annotated, result, profile, masks);
+                    annotated, result, profile, masks, mergedOnto);
         }
         rows.addAll(annotated);
         return rows;
@@ -1781,7 +1816,7 @@ public class CSVImportHelper {
             Map<Integer, Map<String, Object>> rowDataByRowNum,
             List<ImportRowResult<T>> outRows,
             ImportResult<T> aggregate,
-            ImportProfile profile, Map<T, List<String>> rowColumns) {
+            ImportProfile profile, Map<T, List<String>> rowColumns, Map<T, T> mergedOnto) {
 
         Map<String, T> existing = findExistingByRefName(repo, batchBeans);
 
@@ -1813,6 +1848,20 @@ public class CSVImportHelper {
             } else if (intent == Intent.UPDATE && !exists) {
                 rr.getErrors().add(new FieldError("refName",
                         format("Reference '%s' does not exist, so this row cannot be updated.", bean.getRefName()),
+                        FieldErrorCode.VALIDATION));
+            }
+            // Hooks ran on a copy of the record the file's reference matched, so the row carries that
+            // record's identity and values. If they changed the reference, the row no longer
+            // describes that record, and committing it would overwrite or rename it.
+            T target = bean.getRefName() == null ? null : existing.get(bean.getRefName());
+            ObjectId targetId = target == null ? null : target.getId();
+            if (bean.getId() != null && !bean.getId().equals(targetId)) {
+                T original = mergedOnto.get(bean);
+                rr.getErrors().add(new FieldError("refName", original != null
+                        ? format("The import profile changed the reference of existing record '%s' to '%s'; "
+                                + "a row that matches an existing record cannot change its reference.",
+                                original.getRefName(), bean.getRefName())
+                        : format("Reference '%s' does not match the id the row carries.", bean.getRefName()),
                         FieldErrorCode.VALIDATION));
             }
 

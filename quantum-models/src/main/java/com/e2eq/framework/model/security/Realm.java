@@ -1,6 +1,7 @@
 package com.e2eq.framework.model.security;
 
 import com.e2eq.framework.model.persistent.base.BaseModel;
+import com.e2eq.framework.model.persistent.base.GlobalReferenceIdentity;
 import com.mongodb.client.model.CollationStrength;
 import dev.morphia.annotations.Collation;
 import dev.morphia.annotations.Entity;
@@ -29,6 +30,7 @@ import java.util.Date;
       options = @IndexOptions(unique = true, collation = @Collation(locale = "en", strength = CollationStrength.SECONDARY),
          name = Realm.REF_NAME_UNIQUE_INDEX))
 })
+@GlobalReferenceIdentity
 @RegisterForReflection
 @Data
 @EqualsAndHashCode(callSuper = true)

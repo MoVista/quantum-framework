@@ -13,7 +13,10 @@ import com.fasterxml.jackson.databind.deser.BeanDeserializerModifier;
 import com.fasterxml.jackson.databind.deser.std.DelegatingDeserializer;
 import com.fasterxml.jackson.databind.JsonDeserializer;
 import com.fasterxml.jackson.databind.DeserializationConfig;
+import com.fasterxml.jackson.databind.JavaType;
+import com.fasterxml.jackson.databind.introspect.BeanPropertyDefinition;
 import com.fasterxml.jackson.databind.type.ArrayType;
+import com.fasterxml.jackson.databind.type.MapType;
 
 import java.io.IOException;
 import java.util.Collection;
@@ -34,7 +37,9 @@ import java.util.Set;
  * <ul>
  *   <li>With a column list, exactly those property paths are copied, including empty values, so
  *       a blank cell clears the property. Nested paths ({@code address.city}) change only that
- *       nested property. An indexed path ({@code tags[0]}) replaces the whole collection.</li>
+ *       nested property. An indexed path ({@code tags[0]}) replaces the whole collection. A path
+ *       to a map key ({@code customAttributes.plan}) changes only that entry, and a blank value
+ *       removes it; a path to the map itself replaces the whole map.</li>
  *   <li>Identity and system-managed properties are never copied: {@code id}, {@code refName}
  *       (the existing spelling is kept, since other documents' references copy it),
  *       {@code version}, {@code dataDomain}, and {@code auditInfo}.</li>
@@ -71,13 +76,22 @@ public final class ImportRecordMerger {
         for (Class<?> type : REPLACED_CONTAINER_TYPES) {
             deepMerge.configOverride(type).setMergeable(Boolean.FALSE);
         }
+        // Maps are replaced as well, including map types not listed above; the patch carries the
+        // untouched entries of a map whose individual keys were imported (see completeMaps).
         SimpleModule arrays = new SimpleModule("import-array-replacement");
         arrays.setDeserializerModifier(new BeanDeserializerModifier() {
             @Override
             public JsonDeserializer<?> modifyArrayDeserializer(DeserializationConfig config,
                     ArrayType type, com.fasterxml.jackson.databind.BeanDescription bean,
                     JsonDeserializer<?> deserializer) {
-                return new ReplacingArrayDeserializer(deserializer);
+                return new ReplacingDeserializer(deserializer);
+            }
+
+            @Override
+            public JsonDeserializer<?> modifyMapDeserializer(DeserializationConfig config,
+                    MapType type, com.fasterxml.jackson.databind.BeanDescription bean,
+                    JsonDeserializer<?> deserializer) {
+                return new ReplacingDeserializer(deserializer);
             }
         });
         deepMerge.registerModule(arrays);
@@ -85,14 +99,14 @@ public final class ImportRecordMerger {
                 .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
     }
 
-    private static final class ReplacingArrayDeserializer extends DelegatingDeserializer {
-        private ReplacingArrayDeserializer(JsonDeserializer<?> delegate) {
+    private static final class ReplacingDeserializer extends DelegatingDeserializer {
+        private ReplacingDeserializer(JsonDeserializer<?> delegate) {
             super(delegate);
         }
 
         @Override
         protected JsonDeserializer<?> newDelegatingInstance(JsonDeserializer<?> delegate) {
-            return new ReplacingArrayDeserializer(delegate);
+            return new ReplacingDeserializer(delegate);
         }
 
         @Override
@@ -123,11 +137,12 @@ public final class ImportRecordMerger {
         }
         JsonNode existingTree = source.valueToTree(existing);
         Set<String> blankObjects = new java.util.LinkedHashSet<>();
-        ObjectNode patch = buildPatch(incomingObject,
-                existingTree instanceof ObjectNode existingObject ? existingObject : null, columns, blankObjects);
+        ObjectNode existingObject = existingTree instanceof ObjectNode object ? object : null;
+        ObjectNode patch = buildPatch(incomingObject, existingObject, columns, blankObjects);
         if (patch.isEmpty()) {
             return existing;
         }
+        completeMaps(source.constructType(existing.getClass()), patch, existingObject, columns);
         resolveRejectedBlanks(existing, patch, blankObjects);
         return apply(existing, patch);
     }
@@ -209,6 +224,103 @@ public final class ImportRecordMerger {
             copyPath(incoming, existing, patch, path.split("\\."), blankObjects);
         }
         return patch;
+    }
+
+    /**
+     * An imported map replaces the existing one, so when the imported paths select individual keys
+     * of a map ({@code customAttributes.plan}) the patch must also carry the entries the file left
+     * out. Every object on such a path at or below the map is completed with the existing values it
+     * lacks, and a blank map entry is removed rather than stored as null. A path that selects the
+     * map itself, or an object inside it, replaces that value as imported.
+     */
+    private void completeMaps(JavaType rootType, ObjectNode patch, ObjectNode existing, Collection<String> columns) {
+        Set<String> whole = new java.util.HashSet<>();
+        Map<String, Boolean> partial = new java.util.LinkedHashMap<>(); // path -> is the value a map
+        for (String column : columns) {
+            String path = normalize(column);
+            if (path.isEmpty() || PROTECTED_ROOTS.contains(path.split("\\.")[0])) {
+                continue;
+            }
+            whole.add(path);
+            String[] segments = path.split("\\.");
+            JavaType type = rootType;
+            boolean inMap = false;
+            String prefix = "";
+            for (int i = 0; i < segments.length - 1 && type != null; i++) {
+                prefix = prefix.isEmpty() ? segments[i] : prefix + "." + segments[i];
+                type = propertyType(type, segments[i]);
+                inMap |= isMap(type);
+                if (inMap) {
+                    partial.merge(prefix, type != null && type.isMapLikeType(), Boolean::logicalOr);
+                }
+            }
+        }
+        for (Map.Entry<String, Boolean> entry : partial.entrySet()) {
+            String path = entry.getKey();
+            if (whole.stream().anyMatch(selected -> path.equals(selected) || path.startsWith(selected + "."))) {
+                continue; // replaced as imported
+            }
+            if (!(nodeAt(patch, path) instanceof ObjectNode target)) {
+                continue; // cleared or replaced by a scalar
+            }
+            if (entry.getValue()) {
+                List<String> blank = new java.util.ArrayList<>();
+                target.fields().forEachRemaining(field -> {
+                    if (field.getValue().isNull()) {
+                        blank.add(field.getKey());
+                    }
+                });
+                target.remove(blank);
+                if (nodeAt(existing, path) instanceof ObjectNode current) {
+                    current.fields().forEachRemaining(field -> {
+                        if (!target.has(field.getKey()) && !blank.contains(field.getKey())) {
+                            target.set(field.getKey(), field.getValue().deepCopy());
+                        }
+                    });
+                }
+            } else if (nodeAt(existing, path) instanceof ObjectNode current) {
+                current.fields().forEachRemaining(field -> {
+                    if (!target.has(field.getKey())) {
+                        target.set(field.getKey(), field.getValue().deepCopy());
+                    }
+                });
+            }
+        }
+    }
+
+    /** The declared type of a property or map value, or null if it cannot be determined. */
+    private JavaType propertyType(JavaType type, String name) {
+        if (isMap(type)) {
+            return type.isMapLikeType() ? type.getContentType() : type;
+        }
+        if (type.isContainerType() || type.isPrimitive()) {
+            return null;
+        }
+        for (BeanPropertyDefinition property : source.getDeserializationConfig().introspect(type).findProperties()) {
+            if (property.getName().equals(name)) {
+                return property.getPrimaryType();
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Maps, and untyped values, which hold JSON objects as maps. Untyped values are completed but
+     * keep blank entries as null, since they merge into the existing value.
+     */
+    private static boolean isMap(JavaType type) {
+        return type != null && (type.isMapLikeType() || type.hasRawClass(Object.class));
+    }
+
+    private static JsonNode nodeAt(JsonNode root, String path) {
+        JsonNode node = root;
+        for (String segment : path.split("\\.")) {
+            if (node == null) {
+                return null;
+            }
+            node = node.get(segment);
+        }
+        return node;
     }
 
     /** Drops list indexes ({@code tags[0]} becomes {@code tags}) and surrounding whitespace. */

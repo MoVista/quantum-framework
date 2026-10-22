@@ -41,6 +41,9 @@ class ImportRecordMergerTest {
         public Address address;
         public List<String> tags = new ArrayList<>();
         public Map<String, Object> dataDomain;
+        public Map<String, String> attributes;
+        public Map<String, Address> places;
+        public Map<String, Object> settings;
     }
 
     private final ImportRecordMerger merger = new ImportRecordMerger(new ObjectMapper());
@@ -58,6 +61,13 @@ class ImportRecordMergerTest {
         item.address.city = "Springfield";
         item.tags = new ArrayList<>(List.of("one", "two"));
         item.dataDomain = Map.of("ownerId", "owner@a.example");
+        item.attributes = new java.util.LinkedHashMap<>(Map.of("plan", "basic", "region", "east"));
+        Address home = new Address();
+        home.street = "1 Main St";
+        home.city = "Springfield";
+        item.places = new java.util.LinkedHashMap<>(Map.of("home", home));
+        item.settings = new java.util.LinkedHashMap<>(Map.of("theme", "dark",
+                "limits", new java.util.LinkedHashMap<>(Map.of("daily", 5, "monthly", 50))));
         return item;
     }
 
@@ -214,4 +224,54 @@ class ImportRecordMergerTest {
         org.junit.jupiter.api.Assertions.assertArrayEquals(new int[]{3}, current.values);
     }
 
+    @Test
+    void mapKeyColumnChangesOnlyThatEntry() {
+        Item incoming = new Item();
+        incoming.attributes = Map.of("plan", "premium");
+
+        Item merged = merger.merge(existing(), incoming, List.of("attributes.plan"));
+
+        assertEquals(Map.of("plan", "premium", "region", "east"), merged.attributes);
+    }
+
+    @Test
+    void blankMapKeyColumnRemovesOnlyThatEntry() {
+        Item merged = merger.merge(existing(), new Item(), List.of("attributes.plan"));
+
+        assertEquals(Map.of("region", "east"), merged.attributes);
+    }
+
+    @Test
+    void mapColumnReplacesTheWholeMap() {
+        Item incoming = new Item();
+        incoming.attributes = Map.of("plan", "premium");
+
+        Item merged = merger.merge(existing(), incoming, List.of("attributes"));
+
+        assertEquals(Map.of("plan", "premium"), merged.attributes);
+    }
+
+    @Test
+    void nestedColumnUnderAMapValueKeepsItsOtherProperties() {
+        Item incoming = new Item();
+        Address home = new Address();
+        home.city = "Shelbyville";
+        incoming.places = Map.of("home", home);
+
+        Item merged = merger.merge(existing(), incoming, List.of("places.home.city"));
+
+        assertEquals("Shelbyville", merged.places.get("home").city);
+        assertEquals("1 Main St", merged.places.get("home").street);
+    }
+
+    @Test
+    void nestedUntypedMapKeepsItsOtherEntries() {
+        Item incoming = new Item();
+        incoming.settings = Map.of("limits", Map.of("daily", 10));
+
+        Item merged = merger.merge(existing(), incoming, List.of("settings.limits.daily"));
+
+        assertEquals("dark", merged.settings.get("theme"));
+        assertEquals(Map.of("daily", 10, "monthly", 50), merged.settings.get("limits"));
+    }
 }

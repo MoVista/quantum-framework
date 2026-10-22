@@ -346,14 +346,13 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
 
         List<Filter> filters = new ArrayList<>();
         filters.add(Filters.eq("refName", refName));
-        addSharedReferenceTenantFilter(datastore, filters);
-        // Add filters based upon rule and resourceContext;
-       Filter[] qfilters = new Filter[1];;
+        // Add filters based upon rule and resourceContext; building them first also resolves a
+        // missing principal from the request identity before the tenant check below.
        if (!ignoreRules) {
-          qfilters = getFilterArray(filters, getPersistentClass());
-       } else {
-          qfilters = filters.toArray(qfilters);
+          filters = new ArrayList<>(Arrays.asList(getFilterArray(filters, getPersistentClass())));
        }
+       addSharedReferenceTenantFilter(datastore, filters);
+       Filter[] qfilters = filters.toArray(new Filter[0]);
 
         // Compare like the reference-identity unique index so "abc" finds an existing "ABC".
         Query<T> query = datastore.find(getPersistentClass()).filter(combineForMorphiaQuery(qfilters));
@@ -370,9 +369,12 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
         return Optional.ofNullable(obj);
     }
 
-    /** Reference identity in the shared system database is scoped to the calling tenant. */
+    /**
+     * Reference identity in the shared system database is scoped to the calling tenant, except for
+     * entities marked {@link GlobalReferenceIdentity}.
+     */
     private void addSharedReferenceTenantFilter(Datastore datastore, List<Filter> filters) {
-        if (!com.e2eq.framework.model.security.Realm.class.equals(getPersistentClass())
+        if (!getPersistentClass().isAnnotationPresent(GlobalReferenceIdentity.class)
                 && envConfigUtils != null && envConfigUtils.getSystemRealm().equals(datastore.getDatabase().getName())) {
             String tenantId = SecurityContext.getPrincipalContext()
                     .map(PrincipalContext::getDataDomain).map(DataDomain::getTenantId).orElse(null);
