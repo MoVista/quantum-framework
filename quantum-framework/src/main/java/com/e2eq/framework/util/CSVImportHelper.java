@@ -50,6 +50,7 @@ import java.io.*;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Set;
@@ -647,7 +648,7 @@ public class CSVImportHelper {
             ImportResult<T> result, Map<T, Integer> rowNums, Map<T, String> raws, List<String> columns,
             UncarriedColumnWriter<T> uncarriedWriter) {
         int importedBefore = result.getImportedCount();
-        processBatch(repo, batch, failedRecordHandler, result, rowNums, raws, columns, Map.of(), uncarriedWriter);
+        processBatch(repo, batch, failedRecordHandler, result, rowNums, raws, columns, Map.of(), Set.of(), uncarriedWriter);
         result.validRows += result.getImportedCount() - importedBefore;
     }
 
@@ -750,7 +751,7 @@ public class CSVImportHelper {
             Map<T, String> raws,
             List<String> importedColumns) {
 
-        return processBatch(repo, batch, failedRecordHandler, result, rowNums, raws, importedColumns, Map.of(), null);
+        return processBatch(repo, batch, failedRecordHandler, result, rowNums, raws, importedColumns, Map.of(), Set.of(), null);
     }
 
     private <T extends UnversionedBaseModel> ImportResult<T> processBatch(
@@ -760,7 +761,7 @@ public class CSVImportHelper {
             ImportResult<T> result,
             Map<T, Integer> rowNums,
             Map<T, String> raws,
-            List<String> importedColumns, Map<T, List<String>> rowColumns,
+            List<String> importedColumns, Map<T, List<String>> rowColumns, Set<T> stagedInserts,
             UncarriedColumnWriter<T> uncarriedWriter) {
 
         if (batch.isEmpty()) return result;
@@ -774,6 +775,13 @@ public class CSVImportHelper {
             List<String> columns = rowColumns.getOrDefault(bean, importedColumns);
             boolean columnsKnown = columns != null && !columns.isEmpty();
             T current = bean.getRefName() == null ? null : existing.get(bean.getRefName());
+            if (current != null && stagedInserts.contains(bean)) {
+                // The preview found no such record; merging onto one created since would overwrite it.
+                rejectRow(bean, failedRecordHandler, result, rowNums, raws, FieldErrorCode.VALIDATION, format(
+                        "Reference '%s' was created after this file was previewed, so this row cannot be inserted. "
+                                + "Preview the file again to update the existing record.", bean.getRefName()));
+                continue;
+            }
             if (current != null && !columnsKnown) {
                 rejectRow(bean, failedRecordHandler, result, rowNums, raws, FieldErrorCode.VALIDATION, format(
                         "Reference '%s' already exists, but this import does not record which columns it supplies, "
@@ -862,9 +870,9 @@ public class CSVImportHelper {
                 List<T> secondHalf = new ArrayList<>(saved.subList(midPoint, saved.size()));
 
                 processBatch(repo, firstHalf, failedRecordHandler, result, rowNums, raws, importedColumns, rowColumns,
-                        uncarriedWriter);
+                        stagedInserts, uncarriedWriter);
                 processBatch(repo, secondHalf, failedRecordHandler, result, rowNums, raws, importedColumns, rowColumns,
-                        uncarriedWriter);
+                        stagedInserts, uncarriedWriter);
             }
         }
 
@@ -1302,9 +1310,13 @@ public class CSVImportHelper {
             }
             List<T> toSave = new ArrayList<>();
             Map<T, List<String>> rowColumns = new IdentityHashMap<>();
+            Set<T> stagedInserts = Collections.newSetFromMap(new IdentityHashMap<>());
             for (ImportRowResult<T> rr : session.getRows()) {
                 if (!rr.hasErrors() && (rr.getIntent() == Intent.INSERT || rr.getIntent() == Intent.UPDATE)) {
                     toSave.add(rr.getRecord());
+                    if (rr.getIntent() == Intent.INSERT) {
+                        stagedInserts.add(rr.getRecord());
+                    }
                     if (rr.getImportedColumns() != null && session.getImportedColumns() != null) {
                         rowColumns.put(rr.getRecord(), rr.getImportedColumns());
                     }
@@ -1312,7 +1324,8 @@ public class CSVImportHelper {
             }
             ImportResult<T> tmp = new ImportResult<>(0, 0);
             processBatch(repo, toSave, rec -> {
-            }, tmp, new IdentityHashMap<>(), new IdentityHashMap<>(), session.getImportedColumns(), rowColumns, null);
+            }, tmp, new IdentityHashMap<>(), new IdentityHashMap<>(), session.getImportedColumns(), rowColumns,
+                    stagedInserts, null);
             logFailedRows(sessionId, tmp);
             session.setStatus("COMMITTED");
             return new CommitResult(tmp.getImportedCount(), tmp.getFailedCount());
@@ -1341,6 +1354,7 @@ public class CSVImportHelper {
             List<T> toSave = new ArrayList<>(page.size());
             Map<T, Integer> rowNums = new IdentityHashMap<>();
             Map<T, List<String>> rowColumns = new IdentityHashMap<>();
+            Set<T> stagedInserts = Collections.newSetFromMap(new IdentityHashMap<>());
             for (com.e2eq.framework.model.persistent.imports.ImportSessionRow r : page) {
                 if (r.getRecordJson() == null) {
                     tmp.incrementFailedCount();
@@ -1354,6 +1368,9 @@ public class CSVImportHelper {
                     T bean = recordStateCodec().read(r.getRecordStateJson(), repo.getPersistentClass());
                     toSave.add(bean);
                     rowNums.put(bean, r.getRowNumber());
+                    if (Intent.INSERT.name().equals(r.getIntent())) {
+                        stagedInserts.add(bean);
+                    }
                     if (r.getImportedColumns() != null && session.getImportedColumns() != null) {
                         rowColumns.put(bean, r.getImportedColumns());
                     }
@@ -1369,7 +1386,8 @@ public class CSVImportHelper {
             }
             if (!toSave.isEmpty()) {
                 processBatch(repo, toSave, rec -> {
-                }, tmp, rowNums, new IdentityHashMap<>(), session.getImportedColumns(), rowColumns, null);
+                }, tmp, rowNums, new IdentityHashMap<>(), session.getImportedColumns(), rowColumns, stagedInserts,
+                        null);
             }
             skip += page.size();
         }

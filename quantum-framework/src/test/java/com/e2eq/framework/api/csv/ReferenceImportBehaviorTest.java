@@ -213,6 +213,36 @@ public class ReferenceImportBehaviorTest extends BaseRepoTest {
     }
 
     @Test
+    public void commitRejectsAnInsertWhoseReferenceWasCreatedAfterPreview() throws IOException {
+        String raced = unique("Raced");
+        String fresh = unique("Fresh");
+        try (final SecuritySession ignored = new SecuritySession(pContext, rContext)) {
+            CSVImportHelper.ImportResult<CSVModel> preview = analyze("refName,displayName\n"
+                    + raced + ",Imported\n" + fresh + ",Imported\n");
+            try {
+                assertEquals(2, preview.getInsertCount());
+                // Another writer creates the reference between preview and commit.
+                CSVModel other = saveModel(raced.toUpperCase(), "Other writer", "kept");
+
+                CSVImportHelper.CommitResult commit = csvImportHelper.commitImport(preview.getSessionId(), repo);
+
+                assertEquals(1, commit.getImported());
+                assertEquals(1, commit.getFailed());
+                assertEquals(1, collection().countDocuments(refFilter(raced)));
+                CSVModel kept = repo.findByRefName(raced).orElseThrow();
+                assertEquals(other.getId(), kept.getId());
+                assertEquals("Other writer", kept.getDisplayName(), "the other writer's record is not overwritten");
+                assertEquals(1, collection().countDocuments(refFilter(fresh)));
+            } finally {
+                csvImportHelper.cancelImport(preview.getSessionId());
+            }
+        } finally {
+            deleteByRefPattern(raced);
+            deleteByRefPattern(fresh);
+        }
+    }
+
+    @Test
     public void sessionPreviewStagesRowsByOwnIdentityAndCommitUpdatesInPlace() throws IOException {
         String existingRef = unique("Session");
         String insertedRef = unique("Inserted");
