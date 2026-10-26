@@ -264,32 +264,13 @@ public class UserProfileRepo extends MorphiaRepo<UserProfile> {
       }
       UserProfile stored = existing.get();
 
-      // Resolve the attached credentials before anything is deleted. Deleting the profile
-      // authorizes deletion of the credentials it owns. Their provisioning tenant can differ from
-      // the profile's, so credential read rules must not hide them here. The stored references are
-      // editable through the profile API, though, so the rule bypass applies only to credentials
-      // whose own fields tie them to this profile (see ownedCredential). Any other referenced
-      // credential is deleted only if the caller's rules allow it.
-      List<CredentialUserIdPassword> owned = new ArrayList<>();
-      List<EntityReference> unverified = new ArrayList<>();
-      try (var ignored = com.e2eq.framework.model.securityrules.SecurityCallScope.openIgnoringRules()) {
-         CredentialUserIdPassword primary = ownedCredential(stored, stored.getCredentialUserIdPasswordRef(), realmId, null);
-         if (primary != null) {
-            owned.add(primary);
-         } else if (stored.getCredentialUserIdPasswordRef() != null) {
-            unverified.add(stored.getCredentialUserIdPasswordRef());
-         }
-         if (stored.getAdditionalCredentialRefs() != null) {
-            for (EntityReference ref : stored.getAdditionalCredentialRefs()) {
-               CredentialUserIdPassword additional = ownedCredential(stored, ref, realmId, primary);
-               if (additional != null) {
-                  owned.add(additional);
-               } else if (ref != null) {
-                  unverified.add(ref);
-               }
-            }
-         }
-      }
+      // Deleting a profile never grants permissions on credentials: its references are editable,
+      // so they cannot establish ownership. Each linked credential is deleted under the caller's
+      // own rules. If one exists that those rules hide, the whole delete is refused before anything
+      // is changed, rather than deleting the profile and leaving a login that still works.
+      // Additional credentials come first and the primary login last, so a partial failure never
+      // removes the login while credentials issued under it remain.
+      List<LinkedCredential> linked = linkedCredentials(stored);
 
       // The profile is deleted first: that is the authorization check, and its post-delete hooks
       // remove its own edges to the credentials, which could otherwise block deleting them.
@@ -299,58 +280,70 @@ public class UserProfileRepo extends MorphiaRepo<UserProfile> {
          return 0;
       }
 
-      // Every owned credential is attempted. If one cannot be deleted, the profile is restored so
-      // the delete fails as a whole and can be retried. Otherwise the profile would be gone while
-      // the credential could still log in, and a retry would find nothing to clean up.
-      List<CredentialUserIdPassword> remaining = new ArrayList<>();
-      Exception failure = null;
-      try (var ignored = com.e2eq.framework.model.securityrules.SecurityCallScope.openIgnoringRules()) {
-         for (CredentialUserIdPassword credential : owned) {
-            try {
-               deleteOwnedCredential(credential);
-            } catch (Exception e) {
-               remaining.add(credential);
-               if (failure == null) {
-                  failure = e;
-               } else {
-                  failure.addSuppressed(e);
-               }
-            }
-         }
-      }
-      if (!remaining.isEmpty()) {
-         restoreProfile(realmId, stored, snapshot, remaining);
-         if (failure instanceof ReferentialIntegrityViolationException integrity) {
-            throw integrity;
-         }
-         throw failure instanceof RuntimeException runtime ? runtime
-               : new IllegalStateException("Failed to delete the profile's credentials", failure);
-      }
-
-      for (EntityReference ref : unverified) {
-         Optional<CredentialUserIdPassword> visible = findCredential(ref);
-         if (visible.isPresent()) {
-            Log.warnf("Profile %s references credential %s, which does not belong to it; deleting it only under "
-                  + "the caller's permission rules", stored.getUserId(), ref.getEntityRefName());
-            if (credentialRepo.delete(credentialRealm(ref), visible.get()) == 0) {
-               Log.warnf("Credential %s referenced by profile %s was not deleted", ref.getEntityRefName(),
-                     stored.getUserId());
-            }
+      // If a credential cannot be deleted, the profile is restored so the delete fails as a whole and
+      // can be retried. Otherwise the profile would be gone while the credential could still log
+      // in, and a retry would find nothing to clean up.
+      for (int i = 0; i < linked.size(); i++) {
+         try {
+            deleteCredential(linked.get(i));
+         } catch (ReferentialIntegrityViolationException | RuntimeException e) {
+            restoreProfile(realmId, stored, snapshot, linked.subList(i, linked.size()));
+            throw e;
          }
       }
       return deleted;
    }
 
    /**
-    * Deletes a credential the profile owns, retrying once after a database error. A credential
-    * that is already gone counts as deleted.
+    * The credentials a stored profile references, additional credentials first and the primary
+    * last, each resolved under the caller's rules. References to credentials that no longer exist
+    * are skipped.
+    *
+    * @throws ReferentialIntegrityViolationException if a referenced credential exists but the
+    *         caller's rules do not allow it to be read, and so deleted
     */
-   private void deleteOwnedCredential(CredentialUserIdPassword credential) throws ReferentialIntegrityViolationException {
-      String realm = envConfigUtils.getSystemRealm();
+   private List<LinkedCredential> linkedCredentials(UserProfile stored)
+         throws ReferentialIntegrityViolationException {
+      List<EntityReference> refs = new ArrayList<>();
+      if (stored.getAdditionalCredentialRefs() != null) {
+         refs.addAll(stored.getAdditionalCredentialRefs());
+      }
+      refs.add(stored.getCredentialUserIdPasswordRef());
+      Map<org.bson.types.ObjectId, LinkedCredential> linked = new LinkedHashMap<>();
+      for (EntityReference ref : refs) {
+         if (ref == null) {
+            continue;
+         }
+         Optional<CredentialUserIdPassword> visible = findCredential(ref);
+         if (visible.isPresent()) {
+            linked.putIfAbsent(visible.get().getId(), new LinkedCredential(credentialRealm(ref), visible.get()));
+            continue;
+         }
+         boolean exists;
+         try (var ignored = com.e2eq.framework.model.securityrules.SecurityCallScope.openIgnoringRules()) {
+            exists = findCredential(ref).isPresent();
+         }
+         if (exists) {
+            throw new ReferentialIntegrityViolationException(String.format(
+                  "User profile %s cannot be deleted: it is linked to credential %s, which you are not permitted to "
+                        + "delete. Nothing was deleted. Ask an administrator with access to that credential to "
+                        + "delete the profile.", stored.getUserId(), ref.getEntityRefName()),
+                  CredentialUserIdPassword.class.getName(), ref.getEntityRefName(), "refName");
+         }
+      }
+      return new ArrayList<>(linked.values());
+   }
+
+   /**
+    * Deletes a linked credential under the caller's rules, retrying once after a database error. A
+    * credential that is already gone counts as deleted.
+    */
+   private void deleteCredential(LinkedCredential linked) throws ReferentialIntegrityViolationException {
+      String realm = linked.realm();
+      CredentialUserIdPassword credential = linked.credential();
       for (int attempt = 1; ; attempt++) {
          try {
-            if (credentialRepo.delete(realm, credential) == 0
-                  && credentialRepo.findById(credential.getId(), realm).isPresent()) {
+            if (credentialRepo.delete(realm, credential) == 0 && credentialExists(credential, realm)) {
                throw new IllegalStateException("Failed to delete attached credential " + credential.getId());
             }
             return;
@@ -363,14 +356,25 @@ public class UserProfileRepo extends MorphiaRepo<UserProfile> {
       }
    }
 
+   /** A credential linked to a profile, and the realm it is stored in. */
+   private record LinkedCredential(String realm, CredentialUserIdPassword credential) {
+   }
+
+   private boolean credentialExists(CredentialUserIdPassword credential, String realm) {
+      try (var ignored = com.e2eq.framework.model.securityrules.SecurityCallScope.openIgnoringRules()) {
+         return credentialRepo.findById(credential.getId(), realm).isPresent();
+      }
+   }
+
    /**
     * Puts back a profile whose credentials could not all be deleted, exactly as it was stored, and
     * re-runs its post-persist hooks so its ontology edges are materialized again. If even that
     * fails, the credentials that can still log in are logged for manual removal.
     */
    private void restoreProfile(String realmId, UserProfile stored, org.bson.Document snapshot,
-                               List<CredentialUserIdPassword> remaining) {
+                               List<LinkedCredential> remaining) {
       String credentials = remaining.stream()
+            .map(LinkedCredential::credential)
             .map(credential -> credential.getId() + " (userId " + credential.getUserId() + ")")
             .collect(java.util.stream.Collectors.joining(", "));
       try {
@@ -393,37 +397,6 @@ public class UserProfileRepo extends MorphiaRepo<UserProfile> {
       var datastore = morphiaDataStoreWrapper.getDataStore(realmId);
       return datastore.getDatabase().getCollection(
             datastore.getMapper().getEntityModel(UserProfile.class).collectionName());
-   }
-
-   /**
-    * The credential a stored profile reference identifies, if it belongs to that profile. A
-    * credential belongs to a profile in realm {@code realmId} when it is stored in the system realm,
-    * its home realm ({@code domainContext.defaultRealm}) is {@code realmId}, and it is the profile
-    * user's login (same {@code userId}) or a credential issued under that login
-    * ({@code parentCredentialSubject} is the verified primary credential's subject). These fields
-    * are set when the credential is created and are not changed by editing the profile. The
-    * credential's {@code dataDomain} is not used: provisioning may stamp it with another tenant.
-    *
-    * @param profile the stored profile being deleted
-    * @param ref one of its credential references
-    * @param realmId the realm the profile is stored in
-    * @param primary the profile's verified primary credential, or null
-    * @return the owned credential, or null if missing or not owned
-    */
-   private CredentialUserIdPassword ownedCredential(UserProfile profile, EntityReference ref, String realmId,
-                                                    CredentialUserIdPassword primary) {
-      if (ref == null || (ref.getRealm() != null && !ref.getRealm().equals(envConfigUtils.getSystemRealm()))) {
-         return null;
-      }
-      CredentialUserIdPassword credential = findCredential(ref).orElse(null);
-      if (credential == null || credential.getDomainContext() == null
-            || !realmId.equalsIgnoreCase(credential.getDomainContext().getDefaultRealm())) {
-         return null;
-      }
-      boolean sameUser = profile.getUserId() != null && profile.getUserId().equalsIgnoreCase(credential.getUserId());
-      boolean issuedUnderPrimary = primary != null && primary.getSubject() != null
-            && primary.getSubject().equals(credential.getParentCredentialSubject());
-      return sameUser || issuedUnderPrimary ? credential : null;
    }
 
    private String credentialRealm(EntityReference ref) {

@@ -446,7 +446,7 @@ public class ReferenceImportBehaviorTest extends BaseRepoTest {
     com.e2eq.framework.util.SecurityUtils securityUtils;
 
     @Test
-    public void deletingAProfileDeletesItsCredentialStampedWithAnotherTenant() throws Exception {
+    public void profileDeleteIsRefusedWhileALinkedCredentialIsHiddenFromTheCaller() throws Exception {
         String userId = "xtenant-" + UUID.randomUUID().toString().substring(0, 8) + "@test.example";
         String systemRealm = testUtils.getSystemRealm();
         try (final SecuritySession ignored = new SecuritySession(pContext, rContext)) {
@@ -472,13 +472,23 @@ public class ReferenceImportBehaviorTest extends BaseRepoTest {
                     .updateMany(Filters.in("_id", List.of(credential.getId(), additional.getId())),
                             new Document("$set", new Document("dataDomain.tenantId", "provisioning-tenant.example")));
 
-            // Ordinary credential rules hide this record, but deleting its authorized profile must
-            // still revoke the attached credential.
+            // Ordinary credential rules hide these records from the caller. Deleting the profile must
+            // neither bypass those rules nor leave a working login behind, so nothing is deleted.
             assertTrue(credentialRepo.findByRefName(ds, credential.getRefName(), true).isPresent(),
                     "a credential's reference is global, not scoped to the caller's tenant");
             assertTrue(credentialRepo.findByRefName(ds, credential.getRefName(), false).isEmpty());
-            assertEquals(1, userProfileRepo.delete(testUtils.getTestRealm(), profile.getId()));
+            var refused = org.junit.jupiter.api.Assertions.assertThrows(com.e2eq.framework.exceptions.ReferentialIntegrityViolationException.class,
+                    () -> userProfileRepo.delete(testUtils.getTestRealm(), profile.getId()));
+            assertTrue(refused.getMessage().contains("not permitted"), refused.getMessage());
             assertFalse(com.e2eq.framework.model.securityrules.SecurityContext.isIgnoringRules());
+            assertTrue(userProfileRepo.findById(profile.getId(), testUtils.getTestRealm()).isPresent());
+            assertTrue(credentialRepo.findByUserId(userId, systemRealm, true).isPresent());
+            assertTrue(credentialRepo.findByUserId("token-" + userId, systemRealm, true).isPresent());
+
+            // A caller whose rules reach the credentials deletes the profile and both credentials.
+            try (var system = com.e2eq.framework.model.securityrules.SecurityCallScope.openIgnoringRules()) {
+                assertEquals(1, userProfileRepo.delete(testUtils.getTestRealm(), profile.getId()));
+            }
             assertTrue(credentialRepo.findByUserId(userId, systemRealm, true).isEmpty());
             assertTrue(credentialRepo.findByUserId("token-" + userId, systemRealm, true).isEmpty());
         } finally {
@@ -527,10 +537,12 @@ public class ReferenceImportBehaviorTest extends BaseRepoTest {
     }
 
     @Test
-    public void profileCascadeBypassesRulesOnlyForCredentialsTheProfileOwns() throws Exception {
+    public void profileReferencesCannotDeleteCredentialsHiddenFromTheCaller() throws Exception {
         String attackerId = "cascade-attacker-" + UUID.randomUUID().toString().substring(0, 8) + "@test.example";
         String victimId = "cascade-victim-" + UUID.randomUUID().toString().substring(0, 8) + "@test.example";
         String foreignId = "cascade-foreign-" + UUID.randomUUID().toString().substring(0, 8) + "@test.example";
+        String tokenId = "svc:" + UUID.randomUUID();
+        List<String> userIds = List.of(attackerId, victimId, foreignId, tokenId);
         String systemRealm = testUtils.getSystemRealm();
         var credentials = morphiaDataStoreWrapper.getDataStore(systemRealm);
         MongoCollection<Document> credentialCollection = credentials.getDatabase().getCollection(credentials.getMapper()
@@ -550,35 +562,50 @@ public class ReferenceImportBehaviorTest extends BaseRepoTest {
             foreign.setLastUpdate(new java.util.Date());
             foreign.setRoles(new String[]{"user"});
             credentialRepo.save(foreign);
-            // Both are hidden from the caller by its ordinary credential rules.
-            credentialCollection.updateMany(Filters.in("_id", List.of(victim.getId(), foreign.getId())),
+            // The victim's service token, which has no profile of its own.
+            var token = new com.e2eq.framework.model.security.CredentialUserIdPassword();
+            token.setUserId(tokenId);
+            token.setSubject(tokenId.substring(4));
+            token.setRefName(tokenId);
+            token.setDomainContext(testRealmDomainContext());
+            token.setLastUpdate(new java.util.Date());
+            token.setRoles(new String[]{"user"});
+            token.setCredentialType(com.e2eq.framework.model.security.CredentialType.SERVICE_TOKEN);
+            token.setParentCredentialSubject(victim.getSubject());
+            credentialRepo.save(token);
+            // All three are hidden from the caller by its ordinary credential rules.
+            credentialCollection.updateMany(Filters.in("_id", List.of(victim.getId(), foreign.getId(), token.getId())),
                     new Document("$set", new Document("dataDomain.tenantId", "provisioning-tenant.example")));
 
-            // References to other users' credentials, persisted through an ordinary profile save.
+            // Through ordinary profile saves: the profile takes the token's userId and login, and
+            // references the other users' credentials.
+            attacker.setUserId(tokenId);
+            attacker.setCredentialUserIdPasswordRef(token.createEntityReference(systemRealm));
             attacker.setAdditionalCredentialRefs(List.of(victim.createEntityReference(systemRealm),
                     foreign.createEntityReference(systemRealm)));
             userProfileRepo.save(attacker);
 
-            assertEquals(1, userProfileRepo.delete(testUtils.getTestRealm(), attacker.getId()));
-            assertTrue(credentialRepo.findByUserId(attackerId, systemRealm, true).isEmpty(),
-                    "the profile's own credential is deleted");
-            assertTrue(credentialRepo.findByUserId(victimId, systemRealm, true).isPresent(),
-                    "another user's credential in the same realm is not deleted");
-            assertTrue(credentialRepo.findByUserId(foreignId, systemRealm, true).isPresent(),
-                    "a credential homed in another realm is not deleted");
+            org.junit.jupiter.api.Assertions.assertThrows(com.e2eq.framework.exceptions.ReferentialIntegrityViolationException.class,
+                    () -> userProfileRepo.delete(testUtils.getTestRealm(), attacker.getId()));
             assertFalse(com.e2eq.framework.model.securityrules.SecurityContext.isIgnoringRules());
+            assertTrue(userProfileRepo.findById(attacker.getId(), testUtils.getTestRealm()).isPresent(),
+                    "nothing is deleted");
+            for (String userId : List.of(attackerId, victimId, foreignId, tokenId)) {
+                assertTrue(credentialRepo.findByUserId(userId, systemRealm, true).isPresent(), userId);
+            }
         } finally {
-            credentialCollection.deleteMany(Filters.in("userId", List.of(attackerId, victimId, foreignId)));
+            credentialCollection.deleteMany(Filters.in("userId", userIds));
             var tds = morphiaDataStoreWrapper.getDataStore(testUtils.getTestRealm());
             tds.getDatabase().getCollection(tds.getMapper().getEntityModel(
                     com.e2eq.framework.model.security.UserProfile.class).collectionName())
-                    .deleteMany(Filters.in("userId", List.of(attackerId, victimId, foreignId)));
+                    .deleteMany(Filters.in("userId", userIds));
         }
     }
 
     @Test
     public void failedCredentialDeleteRestoresTheProfileSoTheDeleteCanBeRetried() throws Exception {
         String userId = "cascade-retry-" + UUID.randomUUID().toString().substring(0, 8) + "@test.example";
+        String tokenId = "svc:" + UUID.randomUUID();
         String systemRealm = testUtils.getSystemRealm();
         var credentials = morphiaDataStoreWrapper.getDataStore(systemRealm);
         MongoCollection<Document> credentialCollection = credentials.getDatabase().getCollection(credentials.getMapper()
@@ -590,11 +617,24 @@ public class ReferenceImportBehaviorTest extends BaseRepoTest {
             var profile = userProfileRepo.createUser(userId, "Retry", "Cascade", false, new String[]{"user"},
                     "Passw0rd-cascade", testRealmDomainContext());
             var credential = credentialRepo.findByUserId(userId, systemRealm, true).orElseThrow();
+            // A service token issued under the user's login, as AuthResource links it.
+            var token = new com.e2eq.framework.model.security.CredentialUserIdPassword();
+            token.setUserId(tokenId);
+            token.setSubject(tokenId.substring(4));
+            token.setRefName(tokenId);
+            token.setDomainContext(testRealmDomainContext());
+            token.setLastUpdate(new java.util.Date());
+            token.setRoles(new String[]{"user"});
+            token.setCredentialType(com.e2eq.framework.model.security.CredentialType.SERVICE_TOKEN);
+            token.setParentCredentialSubject(credential.getSubject());
+            credentialRepo.save(token);
+            profile.setAdditionalCredentialRefs(List.of(token.createEntityReference(systemRealm)));
+            userProfileRepo.save(profile);
             Document before = profileCollection.find(Filters.eq("_id", profile.getId())).first();
             assertNotNull(before);
-            // A live back-reference (here, to the system user's credential) blocks deleting the credential.
+            // A live back-reference (here, to the system user's credential) blocks deleting the token.
             var blocker = credentialRepo.findByUserId(testUtils.getSystemUserId(), systemRealm, true).orElseThrow();
-            credentialCollection.updateOne(Filters.eq("_id", credential.getId()), new Document("$set",
+            credentialCollection.updateOne(Filters.eq("_id", token.getId()), new Document("$set",
                     new Document("references", List.of(new Document("referencedId", blocker.getId())
                             .append("type", com.e2eq.framework.model.security.CredentialUserIdPassword.class.getName())
                             .append("refName", blocker.getRefName())))));
@@ -603,18 +643,21 @@ public class ReferenceImportBehaviorTest extends BaseRepoTest {
                     com.e2eq.framework.exceptions.ReferentialIntegrityViolationException.class,
                     () -> userProfileRepo.delete(testUtils.getTestRealm(), profile.getId()));
             assertFalse(com.e2eq.framework.model.securityrules.SecurityContext.isIgnoringRules());
-            assertTrue(credentialRepo.findByUserId(userId, systemRealm, true).isPresent());
+            assertTrue(credentialRepo.findByUserId(tokenId, systemRealm, true).isPresent());
+            assertTrue(credentialRepo.findByUserId(userId, systemRealm, true).isPresent(),
+                    "the login is deleted last, so it survives a failed cascade");
             Document restored = profileCollection.find(Filters.eq("_id", profile.getId())).first();
             assertEquals(before, restored, "the profile is restored exactly as it was stored");
 
-            // Once the credential can be deleted, retrying the profile delete completes the cascade.
-            credentialCollection.updateOne(Filters.eq("_id", credential.getId()),
+            // Once the token can be deleted, retrying the profile delete completes the cascade.
+            credentialCollection.updateOne(Filters.eq("_id", token.getId()),
                     new Document("$unset", new Document("references", "")));
             assertEquals(1, userProfileRepo.delete(testUtils.getTestRealm(), profile.getId()));
             assertTrue(credentialRepo.findByUserId(userId, systemRealm, true).isEmpty());
+            assertTrue(credentialRepo.findByUserId(tokenId, systemRealm, true).isEmpty());
             assertEquals(0, profileCollection.countDocuments(Filters.eq("_id", profile.getId())));
         } finally {
-            credentialCollection.deleteMany(Filters.eq("userId", userId));
+            credentialCollection.deleteMany(Filters.in("userId", List.of(userId, tokenId)));
             profileCollection.deleteMany(Filters.eq("userId", userId));
         }
     }
