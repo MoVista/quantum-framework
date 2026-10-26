@@ -930,7 +930,7 @@ public class CSVImportHelper {
      * like the reference-identity unique index, so a row for {@code abc} finds an existing
      * {@code ABC}.
      */
-    private <T extends UnversionedBaseModel> Map<String, T> findExistingByRefName(BaseMorphiaRepo<T> repo, List<T> beans) {
+    <T extends UnversionedBaseModel> Map<String, T> findExistingByRefName(BaseMorphiaRepo<T> repo, List<T> beans) {
         Map<String, T> existing = RefNameMatching.newMap();
         List<String> refNames = beans.stream()
                 .map(T::getRefName)
@@ -940,20 +940,23 @@ public class CSVImportHelper {
         if (refNames.isEmpty()) {
             return existing;
         }
+        // The secured lookup resolves a missing principal from the request identity, so the
+        // importing tenant is read only after it.
+        List<T> found = repo.getListFromRefNames(refNames);
         // A global identity (for example a credential stamped with its provisioning tenant) matches
         // regardless of the tenant stamped on it; permission filters still apply to the lookup.
         String tenant = repo.getPersistentClass().isAnnotationPresent(GlobalReferenceIdentity.class) ? null
                 : SecurityContext.getPrincipalContext()
                         .map(PrincipalContext::getDataDomain).map(DataDomain::getTenantId).orElse(null);
-        for (T found : repo.getListFromRefNames(refNames)) {
-            if (found.getRefName() != null) {
-                if (tenant != null && (found.getDataDomain() == null
-                        || !tenant.equals(found.getDataDomain().getTenantId()))) {
+        for (T match : found) {
+            if (match.getRefName() != null) {
+                if (tenant != null && (match.getDataDomain() == null
+                        || !tenant.equals(match.getDataDomain().getTenantId()))) {
                     continue;
                 }
-                T previous = existing.putIfAbsent(found.getRefName(), found);
-                if (previous != null && !java.util.Objects.equals(previous.getId(), found.getId())) {
-                    throw new IllegalStateException("Ambiguous reference '" + found.getRefName()
+                T previous = existing.putIfAbsent(match.getRefName(), match);
+                if (previous != null && !java.util.Objects.equals(previous.getId(), match.getId())) {
+                    throw new IllegalStateException("Ambiguous reference '" + match.getRefName()
                             + "' in the importing tenant; reconcile duplicate records before importing");
                 }
             }

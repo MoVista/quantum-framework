@@ -33,6 +33,7 @@ import java.util.regex.Pattern;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -78,6 +79,26 @@ public class ReferenceImportBehaviorTest extends BaseRepoTest {
             List<CSVModel> listed = repo.getListFromRefNames(List.of(refName.toUpperCase()));
             assertEquals(1, listed.size());
             assertEquals(refName, listed.get(0).getRefName());
+        } finally {
+            deleteByRefPattern(refName);
+        }
+    }
+
+    @Test
+    public void referenceLookupsKeepExactPermissionComparisons() {
+        String refName = unique("Exact");
+        try (final SecuritySession ignored = new SecuritySession(pContext, rContext)) {
+            CSVModel model = saveModel(refName, "Hidden", null);
+            String tenant = model.getDataDomain().getTenantId();
+            assertNotEquals(tenant, tenant.toUpperCase());
+            // The caller's rules admit only its own tenant; this record differs from it only in case.
+            collection().updateOne(Filters.eq("_id", model.getId()),
+                    new Document("$set", new Document("dataDomain.tenantId", tenant.toUpperCase())));
+
+            assertTrue(repo.findById(model.getId()).isEmpty(), "the ordinary secured query excludes the record");
+            assertTrue(repo.findByRefName(refName).isEmpty());
+            assertTrue(repo.findByRefName(refName.toLowerCase()).isEmpty());
+            assertTrue(repo.getListFromRefNames(List.of(refName, refName.toUpperCase())).isEmpty());
         } finally {
             deleteByRefPattern(refName);
         }
