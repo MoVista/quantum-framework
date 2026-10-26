@@ -61,7 +61,8 @@ public class MorphiaDataStoreWrapper {
    @jakarta.annotation.PostConstruct
    void applyBaseDeclaredIndexes() {
       if (createDeclaredIndexes) {
-         DeclaredIndexes.ensureAll(dataStore);
+         // Runs before migrations; a failure is logged and retried by the post-migration step.
+         DeclaredIndexes.ensureAllTolerating(dataStore);
       }
    }
 
@@ -102,9 +103,11 @@ public class MorphiaDataStoreWrapper {
          mdatastore.getMapper().map(entityType);
       }
 
-      // Apply indexes and document validations
+      // Apply indexes and document validations. This runs before the realm's migrations, which may
+      // be what repairs data blocking an index, so a failure must not stop the datastore from
+      // being created and cached; the post-migration index step retries and reports it.
       if (createDeclaredIndexes) {
-         DeclaredIndexes.ensureAll(mdatastore);
+         DeclaredIndexes.ensureAllTolerating(mdatastore);
       }
 
       if (baseConfig.applyDocumentValidations()) {

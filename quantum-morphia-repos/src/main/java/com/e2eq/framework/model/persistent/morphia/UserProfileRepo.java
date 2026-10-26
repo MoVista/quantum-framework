@@ -267,32 +267,93 @@ public class UserProfileRepo extends MorphiaRepo<UserProfile> {
       if (deleted == 0) {
          return 0;
       }
-      // Deleting the profile authorizes deletion of its attached credentials. Their provisioning
+      // Deleting the profile authorizes deletion of the credentials it owns. Their provisioning
       // tenant can differ from the profile's, so credential read rules must not hide them here.
+      // The stored references are editable through the profile API, though, so the rule bypass
+      // applies only to credentials whose own fields tie them to this profile (see ownedCredential). Any
+      // other referenced credential is deleted only if the caller's rules allow it.
+      List<EntityReference> unverified = new ArrayList<>();
       try (var ignored = com.e2eq.framework.model.securityrules.SecurityCallScope.openIgnoringRules()) {
-         deleteAttachedCredential(stored.getCredentialUserIdPasswordRef());
+         CredentialUserIdPassword primary = ownedCredential(stored, stored.getCredentialUserIdPasswordRef(), realmId, null);
+         if (primary != null) {
+            deleteCredential(primary, envConfigUtils.getSystemRealm());
+         } else if (stored.getCredentialUserIdPasswordRef() != null) {
+            unverified.add(stored.getCredentialUserIdPasswordRef());
+         }
          if (stored.getAdditionalCredentialRefs() != null) {
             for (EntityReference ref : stored.getAdditionalCredentialRefs()) {
-               deleteAttachedCredential(ref);
+               CredentialUserIdPassword additional = ownedCredential(stored, ref, realmId, primary);
+               if (additional != null) {
+                  deleteCredential(additional, envConfigUtils.getSystemRealm());
+               } else if (ref != null) {
+                  unverified.add(ref);
+               }
+            }
+         }
+      }
+      for (EntityReference ref : unverified) {
+         Optional<CredentialUserIdPassword> visible = findCredential(ref);
+         if (visible.isPresent()) {
+            Log.warnf("Profile %s references credential %s, which does not belong to it; deleting it only under "
+                  + "the caller's permission rules", stored.getUserId(), ref.getEntityRefName());
+            if (credentialRepo.delete(credentialRealm(ref), visible.get()) == 0) {
+               Log.warnf("Credential %s referenced by profile %s was not deleted", ref.getEntityRefName(),
+                     stored.getUserId());
             }
          }
       }
       return deleted;
    }
 
-   private void deleteAttachedCredential(EntityReference ref) throws ReferentialIntegrityViolationException {
-      if (ref == null) {
-         return;
+   /**
+    * The credential a stored profile reference identifies, if it belongs to that profile. A
+    * credential belongs to a profile in realm {@code realmId} when it is stored in the system realm,
+    * its home realm ({@code domainContext.defaultRealm}) is {@code realmId}, and it is the profile
+    * user's login (same {@code userId}) or a credential issued under that login
+    * ({@code parentCredentialSubject} is the verified primary credential's subject). These fields
+    * are set when the credential is created and are not changed by editing the profile. The
+    * credential's {@code dataDomain} is not used: provisioning may stamp it with another tenant.
+    *
+    * @param profile the stored profile being deleted
+    * @param ref one of its credential references
+    * @param realmId the realm the profile is stored in
+    * @param primary the profile's verified primary credential, or null
+    * @return the owned credential, or null if missing or not owned
+    */
+   private CredentialUserIdPassword ownedCredential(UserProfile profile, EntityReference ref, String realmId,
+                                                    CredentialUserIdPassword primary) {
+      if (ref == null || (ref.getRealm() != null && !ref.getRealm().equals(envConfigUtils.getSystemRealm()))) {
+         return null;
       }
-      String realm = ref.getRealm() != null ? ref.getRealm() : envConfigUtils.getSystemRealm();
+      CredentialUserIdPassword credential = findCredential(ref).orElse(null);
+      if (credential == null || credential.getDomainContext() == null
+            || !realmId.equalsIgnoreCase(credential.getDomainContext().getDefaultRealm())) {
+         return null;
+      }
+      boolean sameUser = profile.getUserId() != null && profile.getUserId().equalsIgnoreCase(credential.getUserId());
+      boolean issuedUnderPrimary = primary != null && primary.getSubject() != null
+            && primary.getSubject().equals(credential.getParentCredentialSubject());
+      return sameUser || issuedUnderPrimary ? credential : null;
+   }
+
+   private String credentialRealm(EntityReference ref) {
+      return ref.getRealm() != null ? ref.getRealm() : envConfigUtils.getSystemRealm();
+   }
+
+   private Optional<CredentialUserIdPassword> findCredential(EntityReference ref) {
+      String realm = credentialRealm(ref);
       // The stored id identifies the credential even if its reference spelling has changed. A
       // missing id is supported for legacy profile references; an unmatched id never falls back
       // to a potentially unrelated record with the same name.
-      Optional<CredentialUserIdPassword> credential = ref.getEntityId() != null
+      return ref.getEntityId() != null
             ? credentialRepo.findById(ref.getEntityId(), realm)
             : credentialRepo.findByRefName(ref.getEntityRefName(), realm);
-      if (credential.isPresent() && credentialRepo.delete(realm, credential.get()) == 0) {
-         throw new IllegalStateException("Failed to delete attached credential " + ref.getEntityId());
+   }
+
+   private void deleteCredential(CredentialUserIdPassword credential, String realm)
+         throws ReferentialIntegrityViolationException {
+      if (credentialRepo.delete(realm, credential) == 0) {
+         throw new IllegalStateException("Failed to delete attached credential " + credential.getId());
       }
    }
 }

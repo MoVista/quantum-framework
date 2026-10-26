@@ -70,6 +70,39 @@ public final class DeclaredIndexes {
     }
 
     /**
+     * Applies {@link #ensure} to every concrete mapped entity of a datastore without failing: each
+     * entity is attempted, and failures are logged and returned. Automatic index creation when a
+     * datastore is created uses this, because it runs before migrations. Data that a pending
+     * migration must repair (for example duplicate references that block a new unique index) must
+     * not make the realm unreachable or stop that migration from running. The post-migration index
+     * step ({@code MigrationService.applyAllIndexes}) remains authoritative and fails on the same
+     * error.
+     *
+     * @param datastore the datastore to index
+     * @return one message per entity whose indexes could not be applied; empty on success
+     */
+    public static List<String> ensureAllTolerating(MorphiaDatastore datastore) {
+        List<String> failures = new ArrayList<>();
+        for (EntityModel entity : new ArrayList<>(datastore.getMapper().getMappedEntities())) {
+            if (!isIndexable(entity)) {
+                continue;
+            }
+            try {
+                ensure(datastore, entity.getType());
+            } catch (RuntimeException e) {
+                failures.add(String.format("%s (%s): %s", entity.collectionName(), entity.getType().getSimpleName(),
+                        e.getMessage()));
+            }
+        }
+        if (!failures.isEmpty()) {
+            io.quarkus.logging.Log.errorf("Automatic index creation failed for %d collection(s) in %s; the next "
+                    + "migration call retries them and reports the failure. %s", failures.size(),
+                    datastore.getDatabase().getName(), String.join("; ", failures));
+        }
+        return failures;
+    }
+
+    /**
      * Whether an entity model gets indexes: a concrete {@code @Entity} with an id.
      *
      * @param entity the entity model

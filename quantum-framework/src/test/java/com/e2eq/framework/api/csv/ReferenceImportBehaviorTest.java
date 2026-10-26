@@ -418,7 +418,7 @@ public class ReferenceImportBehaviorTest extends BaseRepoTest {
         String systemRealm = testUtils.getSystemRealm();
         try (final SecuritySession ignored = new SecuritySession(pContext, rContext)) {
             var profile = userProfileRepo.createUser(userId, "Cross", "Tenant", false, new String[] {"user"},
-                    "Passw0rd-xtenant", securityUtils.getDefaultDomainContext());
+                    "Passw0rd-xtenant", testRealmDomainContext());
             var credential = credentialRepo.findByUserId(userId, systemRealm, true).orElseThrow();
             var additional = new com.e2eq.framework.model.security.CredentialUserIdPassword();
             additional.setUserId("token-" + userId);
@@ -466,9 +466,9 @@ public class ReferenceImportBehaviorTest extends BaseRepoTest {
         String secondId = "cascade-second-" + UUID.randomUUID().toString().substring(0, 8) + "@test.example";
         try (final SecuritySession ignored = new SecuritySession(pContext, rContext)) {
             var first = userProfileRepo.createUser(firstId, "First", "Owner", false, new String[]{"user"},
-                    "Passw0rd-cascade", securityUtils.getDefaultDomainContext());
+                    "Passw0rd-cascade", testRealmDomainContext());
             var second = userProfileRepo.createUser(secondId, "Second", "Owner", false, new String[]{"user"},
-                    "Passw0rd-cascade", securityUtils.getDefaultDomainContext());
+                    "Passw0rd-cascade", testRealmDomainContext());
             // A caller cannot replace the persisted reference just by passing a different object to delete.
             first.setCredentialUserIdPasswordRef(second.getCredentialUserIdPasswordRef());
             assertEquals(1, userProfileRepo.delete(testUtils.getTestRealm(), first));
@@ -491,6 +491,61 @@ public class ReferenceImportBehaviorTest extends BaseRepoTest {
                 }
             }
         }
+    }
+
+    @Test
+    public void profileCascadeBypassesRulesOnlyForCredentialsTheProfileOwns() throws Exception {
+        String attackerId = "cascade-attacker-" + UUID.randomUUID().toString().substring(0, 8) + "@test.example";
+        String victimId = "cascade-victim-" + UUID.randomUUID().toString().substring(0, 8) + "@test.example";
+        String foreignId = "cascade-foreign-" + UUID.randomUUID().toString().substring(0, 8) + "@test.example";
+        String systemRealm = testUtils.getSystemRealm();
+        var credentials = morphiaDataStoreWrapper.getDataStore(systemRealm);
+        MongoCollection<Document> credentialCollection = credentials.getDatabase().getCollection(credentials.getMapper()
+                .getEntityModel(com.e2eq.framework.model.security.CredentialUserIdPassword.class).collectionName());
+        try (final SecuritySession ignored = new SecuritySession(pContext, rContext)) {
+            var attacker = userProfileRepo.createUser(attackerId, "Attacker", "Admin", false, new String[]{"user"},
+                    "Passw0rd-cascade", testRealmDomainContext());
+            userProfileRepo.createUser(victimId, "Victim", "User", false, new String[]{"user"},
+                    "Passw0rd-cascade", testRealmDomainContext());
+            var victim = credentialRepo.findByUserId(victimId, systemRealm, true).orElseThrow();
+            var foreign = new com.e2eq.framework.model.security.CredentialUserIdPassword();
+            foreign.setUserId(foreignId);
+            foreign.setSubject(UUID.randomUUID().toString());
+            foreign.setRefName(foreign.getSubject());
+            foreign.setDomainContext(new com.e2eq.framework.model.security.DomainContext(
+                    pContext.getDataDomain(), "another-tenant-com"));
+            foreign.setLastUpdate(new java.util.Date());
+            foreign.setRoles(new String[]{"user"});
+            credentialRepo.save(foreign);
+            // Both are hidden from the caller by its ordinary credential rules.
+            credentialCollection.updateMany(Filters.in("_id", List.of(victim.getId(), foreign.getId())),
+                    new Document("$set", new Document("dataDomain.tenantId", "provisioning-tenant.example")));
+
+            // References to other users' credentials, persisted through an ordinary profile save.
+            attacker.setAdditionalCredentialRefs(List.of(victim.createEntityReference(systemRealm),
+                    foreign.createEntityReference(systemRealm)));
+            userProfileRepo.save(attacker);
+
+            assertEquals(1, userProfileRepo.delete(testUtils.getTestRealm(), attacker.getId()));
+            assertTrue(credentialRepo.findByUserId(attackerId, systemRealm, true).isEmpty(),
+                    "the profile's own credential is deleted");
+            assertTrue(credentialRepo.findByUserId(victimId, systemRealm, true).isPresent(),
+                    "another user's credential in the same realm is not deleted");
+            assertTrue(credentialRepo.findByUserId(foreignId, systemRealm, true).isPresent(),
+                    "a credential homed in another realm is not deleted");
+            assertFalse(com.e2eq.framework.model.securityrules.SecurityContext.isIgnoringRules());
+        } finally {
+            credentialCollection.deleteMany(Filters.in("userId", List.of(attackerId, victimId, foreignId)));
+            var tds = morphiaDataStoreWrapper.getDataStore(testUtils.getTestRealm());
+            tds.getDatabase().getCollection(tds.getMapper().getEntityModel(
+                    com.e2eq.framework.model.security.UserProfile.class).collectionName())
+                    .deleteMany(Filters.in("userId", List.of(attackerId, victimId, foreignId)));
+        }
+    }
+
+    /** A login homed in the test realm, where these tests store user profiles. */
+    private com.e2eq.framework.model.security.DomainContext testRealmDomainContext() {
+        return new com.e2eq.framework.model.security.DomainContext(pContext.getDataDomain(), testUtils.getTestRealm());
     }
 
     @Test

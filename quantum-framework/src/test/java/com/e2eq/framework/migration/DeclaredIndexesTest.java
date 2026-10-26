@@ -143,6 +143,32 @@ public class DeclaredIndexesTest {
     }
 
     @Test
+    public void automaticIndexFailureLeavesTheRealmReachableForItsMigrations() {
+        String realm = "declared-indexes-dup-" + UUID.randomUUID().toString().substring(0, 8);
+        try {
+            // Legacy duplicates that a pending migration would reconcile block the new unique index.
+            String collection = baseDatastore.getMapper().getEntityModel(UnversionedTestModel.class).collectionName();
+            for (String refName : java.util.List.of("legacy-dup", "LEGACY-DUP")) {
+                mongoClient.getDatabase(realm).getCollection(collection).insertOne(new Document("refName", refName)
+                        .append("dataDomain", new Document("tenantId", "dup-tenant.example")));
+            }
+
+            MorphiaDatastore datastore = morphiaDataStoreWrapper.getDataStore(realm);
+            assertTrue(datastore == morphiaDataStoreWrapper.getDataStore(realm), "the datastore is cached");
+            Set<String> automatic = indexNames(collection(datastore, UnversionedTestModel.class));
+            assertFalse(automatic.contains(UnversionedBaseModel.REF_NAME_TENANT_UNIQUE_INDEX), automatic.toString());
+
+            // The post-migration step remains authoritative and reports the failure.
+            com.e2eq.framework.model.persistent.migration.base.IndexBuildException failure = assertThrows(
+                    com.e2eq.framework.model.persistent.migration.base.IndexBuildException.class,
+                    () -> migrationService.applyAllIndexes(realm));
+            assertTrue(failure.getMessage().contains(collection), failure.getMessage());
+        } finally {
+            mongoClient.getDatabase(realm).drop();
+        }
+    }
+
+    @Test
     public void excludingAnIndexNoSuperclassDeclaresIsRejected() {
         IllegalStateException failure = assertThrows(IllegalStateException.class,
                 () -> DeclaredIndexes.excludedNames(MisnamedExclusion.class));
