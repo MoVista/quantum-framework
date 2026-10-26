@@ -243,6 +243,38 @@ public class ReferenceImportBehaviorTest extends BaseRepoTest {
     }
 
     @Test
+    public void commitKeepsInsertsStoredByItsOwnPartlyFailedBatch() throws IOException {
+        String first = unique("Stored");
+        String second = unique("Clash");
+        String displayName = unique("SameName");
+        // A unique index on another field makes the second insert of the batch fail after the first
+        // has been stored.
+        String index = collection().createIndex(new Document("displayName", 1), new com.mongodb.client.model.IndexOptions()
+                .name("test_" + displayName).unique(true)
+                .partialFilterExpression(new Document("displayName", displayName)));
+        try (final SecuritySession ignored = new SecuritySession(pContext, rContext)) {
+            CSVImportHelper.ImportResult<CSVModel> preview = analyze("refName,displayName\n"
+                    + first + "," + displayName + "\n" + second + "," + displayName + "\n");
+            try {
+                assertEquals(2, preview.getInsertCount());
+
+                CSVImportHelper.CommitResult commit = csvImportHelper.commitImport(preview.getSessionId(), repo);
+
+                assertEquals(1, commit.getImported(), "the stored insert is not reported as created by someone else");
+                assertEquals(1, commit.getFailed());
+                assertEquals(1, collection().countDocuments(refFilter(first)));
+                assertEquals(0, collection().countDocuments(refFilter(second)));
+            } finally {
+                csvImportHelper.cancelImport(preview.getSessionId());
+            }
+        } finally {
+            collection().dropIndex(index);
+            deleteByRefPattern(first);
+            deleteByRefPattern(second);
+        }
+    }
+
+    @Test
     public void sessionPreviewStagesRowsByOwnIdentityAndCommitUpdatesInPlace() throws IOException {
         String existingRef = unique("Session");
         String insertedRef = unique("Inserted");

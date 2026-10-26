@@ -869,10 +869,13 @@ public class CSVImportHelper {
                 List<T> firstHalf = new ArrayList<>(saved.subList(0, midPoint));
                 List<T> secondHalf = new ArrayList<>(saved.subList(midPoint, saved.size()));
 
+                // The failed save is not atomic: rows before the failing one may already be stored.
+                // Every staged insert here was confirmed absent before that save, so a match found on
+                // retry is this commit's own record and is merged and saved again, not rejected.
                 processBatch(repo, firstHalf, failedRecordHandler, result, rowNums, raws, importedColumns, rowColumns,
-                        stagedInserts, uncarriedWriter);
+                        Set.of(), uncarriedWriter);
                 processBatch(repo, secondHalf, failedRecordHandler, result, rowNums, raws, importedColumns, rowColumns,
-                        stagedInserts, uncarriedWriter);
+                        Set.of(), uncarriedWriter);
             }
         }
 
