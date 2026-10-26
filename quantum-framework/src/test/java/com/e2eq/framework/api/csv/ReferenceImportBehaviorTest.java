@@ -159,6 +159,39 @@ public class ReferenceImportBehaviorTest extends BaseRepoTest {
     }
 
     @Test
+    public void manyRowsOfOneReferenceGetABoundedMessage() throws IOException {
+        String repeated = unique("Many");
+        StringBuilder rows = new StringBuilder();
+        for (int row = 1; row <= 40; row++) {
+            rows.append(row % 2 == 0 ? repeated.toLowerCase() : repeated).append(",Row ").append(row).append('\n');
+        }
+        String expected = "Reference '" + repeated + "' appears in 40 rows of this file "
+                + "(rows 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 and 30 more); each reference may appear only once.";
+        try (final SecuritySession ignored = new SecuritySession(pContext, rContext)) {
+            CSVImportHelper.ImportResult<CSVModel> imported = importCsv(rows.toString());
+            assertEquals(40, imported.getFailedCount());
+            imported.getRowResults().forEach(row -> assertEquals(expected, row.getErrors().get(0).getMessage()));
+
+            CSVImportHelper.ImportResult<CSVModel> preview = analyze("refName,displayName\n" + rows);
+            try {
+                assertEquals(40, preview.getErrorRows());
+                for (int row : List.of(1, 20, 40)) {
+                    ImportSessionRow staged = importSessionRowRepo
+                            .findByRefName(ImportSessionRow.stagingRefName(preview.getSessionId(), row)).orElseThrow();
+                    assertTrue(staged.isHasErrors());
+                    assertTrue(staged.getErrorsJson().contains(expected), staged.getErrorsJson());
+                    assertTrue(staged.getErrorsJson().length() < 500, staged.getErrorsJson());
+                }
+            } finally {
+                csvImportHelper.cancelImport(preview.getSessionId());
+            }
+            assertEquals(0, collection().countDocuments(refFilter(repeated)));
+        } finally {
+            deleteByRefPattern(repeated);
+        }
+    }
+
+    @Test
     public void sessionPreviewStagesRowsByOwnIdentityAndCommitUpdatesInPlace() throws IOException {
         String existingRef = unique("Session");
         String insertedRef = unique("Inserted");
@@ -540,6 +573,49 @@ public class ReferenceImportBehaviorTest extends BaseRepoTest {
             tds.getDatabase().getCollection(tds.getMapper().getEntityModel(
                     com.e2eq.framework.model.security.UserProfile.class).collectionName())
                     .deleteMany(Filters.in("userId", List.of(attackerId, victimId, foreignId)));
+        }
+    }
+
+    @Test
+    public void failedCredentialDeleteRestoresTheProfileSoTheDeleteCanBeRetried() throws Exception {
+        String userId = "cascade-retry-" + UUID.randomUUID().toString().substring(0, 8) + "@test.example";
+        String systemRealm = testUtils.getSystemRealm();
+        var credentials = morphiaDataStoreWrapper.getDataStore(systemRealm);
+        MongoCollection<Document> credentialCollection = credentials.getDatabase().getCollection(credentials.getMapper()
+                .getEntityModel(com.e2eq.framework.model.security.CredentialUserIdPassword.class).collectionName());
+        var profiles = morphiaDataStoreWrapper.getDataStore(testUtils.getTestRealm());
+        MongoCollection<Document> profileCollection = profiles.getDatabase().getCollection(profiles.getMapper()
+                .getEntityModel(com.e2eq.framework.model.security.UserProfile.class).collectionName());
+        try (final SecuritySession ignored = new SecuritySession(pContext, rContext)) {
+            var profile = userProfileRepo.createUser(userId, "Retry", "Cascade", false, new String[]{"user"},
+                    "Passw0rd-cascade", testRealmDomainContext());
+            var credential = credentialRepo.findByUserId(userId, systemRealm, true).orElseThrow();
+            Document before = profileCollection.find(Filters.eq("_id", profile.getId())).first();
+            assertNotNull(before);
+            // A live back-reference (here, to the system user's credential) blocks deleting the credential.
+            var blocker = credentialRepo.findByUserId(testUtils.getSystemUserId(), systemRealm, true).orElseThrow();
+            credentialCollection.updateOne(Filters.eq("_id", credential.getId()), new Document("$set",
+                    new Document("references", List.of(new Document("referencedId", blocker.getId())
+                            .append("type", com.e2eq.framework.model.security.CredentialUserIdPassword.class.getName())
+                            .append("refName", blocker.getRefName())))));
+
+            org.junit.jupiter.api.Assertions.assertThrows(
+                    com.e2eq.framework.exceptions.ReferentialIntegrityViolationException.class,
+                    () -> userProfileRepo.delete(testUtils.getTestRealm(), profile.getId()));
+            assertFalse(com.e2eq.framework.model.securityrules.SecurityContext.isIgnoringRules());
+            assertTrue(credentialRepo.findByUserId(userId, systemRealm, true).isPresent());
+            Document restored = profileCollection.find(Filters.eq("_id", profile.getId())).first();
+            assertEquals(before, restored, "the profile is restored exactly as it was stored");
+
+            // Once the credential can be deleted, retrying the profile delete completes the cascade.
+            credentialCollection.updateOne(Filters.eq("_id", credential.getId()),
+                    new Document("$unset", new Document("references", "")));
+            assertEquals(1, userProfileRepo.delete(testUtils.getTestRealm(), profile.getId()));
+            assertTrue(credentialRepo.findByUserId(userId, systemRealm, true).isEmpty());
+            assertEquals(0, profileCollection.countDocuments(Filters.eq("_id", profile.getId())));
+        } finally {
+            credentialCollection.deleteMany(Filters.eq("userId", userId));
+            profileCollection.deleteMany(Filters.eq("userId", userId));
         }
     }
 

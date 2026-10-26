@@ -110,7 +110,7 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
     @ConfigProperty(name = "quantum.morphia.maxSkippedUnparseableDocuments", defaultValue = "1000")
     protected int maxSkippedUnparseableDocuments;
 
-    private void callPostPersistHooks(String realmId, Object entity) {
+    protected void callPostPersistHooks(String realmId, Object entity) {
         lifecycleHooks().callPostPersistHooks(realmId, entity);
     }
 

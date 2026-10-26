@@ -263,20 +263,19 @@ public class UserProfileRepo extends MorphiaRepo<UserProfile> {
          return 0;
       }
       UserProfile stored = existing.get();
-      long deleted = super.delete(realmId, id);
-      if (deleted == 0) {
-         return 0;
-      }
-      // Deleting the profile authorizes deletion of the credentials it owns. Their provisioning
-      // tenant can differ from the profile's, so credential read rules must not hide them here.
-      // The stored references are editable through the profile API, though, so the rule bypass
-      // applies only to credentials whose own fields tie them to this profile (see ownedCredential). Any
-      // other referenced credential is deleted only if the caller's rules allow it.
+
+      // Resolve the attached credentials before anything is deleted. Deleting the profile
+      // authorizes deletion of the credentials it owns. Their provisioning tenant can differ from
+      // the profile's, so credential read rules must not hide them here. The stored references are
+      // editable through the profile API, though, so the rule bypass applies only to credentials
+      // whose own fields tie them to this profile (see ownedCredential). Any other referenced
+      // credential is deleted only if the caller's rules allow it.
+      List<CredentialUserIdPassword> owned = new ArrayList<>();
       List<EntityReference> unverified = new ArrayList<>();
       try (var ignored = com.e2eq.framework.model.securityrules.SecurityCallScope.openIgnoringRules()) {
          CredentialUserIdPassword primary = ownedCredential(stored, stored.getCredentialUserIdPasswordRef(), realmId, null);
          if (primary != null) {
-            deleteCredential(primary, envConfigUtils.getSystemRealm());
+            owned.add(primary);
          } else if (stored.getCredentialUserIdPasswordRef() != null) {
             unverified.add(stored.getCredentialUserIdPasswordRef());
          }
@@ -284,13 +283,50 @@ public class UserProfileRepo extends MorphiaRepo<UserProfile> {
             for (EntityReference ref : stored.getAdditionalCredentialRefs()) {
                CredentialUserIdPassword additional = ownedCredential(stored, ref, realmId, primary);
                if (additional != null) {
-                  deleteCredential(additional, envConfigUtils.getSystemRealm());
+                  owned.add(additional);
                } else if (ref != null) {
                   unverified.add(ref);
                }
             }
          }
       }
+
+      // The profile is deleted first: that is the authorization check, and its post-delete hooks
+      // remove its own edges to the credentials, which could otherwise block deleting them.
+      org.bson.Document snapshot = profileCollection(realmId).find(new org.bson.Document("_id", id)).first();
+      long deleted = super.delete(realmId, id);
+      if (deleted == 0) {
+         return 0;
+      }
+
+      // Every owned credential is attempted. If one cannot be deleted, the profile is restored so
+      // the delete fails as a whole and can be retried. Otherwise the profile would be gone while
+      // the credential could still log in, and a retry would find nothing to clean up.
+      List<CredentialUserIdPassword> remaining = new ArrayList<>();
+      Exception failure = null;
+      try (var ignored = com.e2eq.framework.model.securityrules.SecurityCallScope.openIgnoringRules()) {
+         for (CredentialUserIdPassword credential : owned) {
+            try {
+               deleteOwnedCredential(credential);
+            } catch (Exception e) {
+               remaining.add(credential);
+               if (failure == null) {
+                  failure = e;
+               } else {
+                  failure.addSuppressed(e);
+               }
+            }
+         }
+      }
+      if (!remaining.isEmpty()) {
+         restoreProfile(realmId, stored, snapshot, remaining);
+         if (failure instanceof ReferentialIntegrityViolationException integrity) {
+            throw integrity;
+         }
+         throw failure instanceof RuntimeException runtime ? runtime
+               : new IllegalStateException("Failed to delete the profile's credentials", failure);
+      }
+
       for (EntityReference ref : unverified) {
          Optional<CredentialUserIdPassword> visible = findCredential(ref);
          if (visible.isPresent()) {
@@ -303,6 +339,60 @@ public class UserProfileRepo extends MorphiaRepo<UserProfile> {
          }
       }
       return deleted;
+   }
+
+   /**
+    * Deletes a credential the profile owns, retrying once after a database error. A credential
+    * that is already gone counts as deleted.
+    */
+   private void deleteOwnedCredential(CredentialUserIdPassword credential) throws ReferentialIntegrityViolationException {
+      String realm = envConfigUtils.getSystemRealm();
+      for (int attempt = 1; ; attempt++) {
+         try {
+            if (credentialRepo.delete(realm, credential) == 0
+                  && credentialRepo.findById(credential.getId(), realm).isPresent()) {
+               throw new IllegalStateException("Failed to delete attached credential " + credential.getId());
+            }
+            return;
+         } catch (com.mongodb.MongoException e) {
+            if (attempt >= 2) {
+               throw e;
+            }
+            Log.warnf(e, "Retrying deletion of credential %s", credential.getId());
+         }
+      }
+   }
+
+   /**
+    * Puts back a profile whose credentials could not all be deleted, exactly as it was stored, and
+    * re-runs its post-persist hooks so its ontology edges are materialized again. If even that
+    * fails, the credentials that can still log in are logged for manual removal.
+    */
+   private void restoreProfile(String realmId, UserProfile stored, org.bson.Document snapshot,
+                               List<CredentialUserIdPassword> remaining) {
+      String credentials = remaining.stream()
+            .map(credential -> credential.getId() + " (userId " + credential.getUserId() + ")")
+            .collect(java.util.stream.Collectors.joining(", "));
+      try {
+         if (snapshot == null) {
+            throw new IllegalStateException("no snapshot of the profile was taken");
+         }
+         profileCollection(realmId).insertOne(snapshot);
+         callPostPersistHooks(realmId, stored);
+         Log.errorf("Deleting profile %s (%s) in %s failed because credential(s) %s could not be deleted; "
+               + "the profile was restored so the delete can be retried", stored.getUserId(), stored.getId(),
+               realmId, credentials);
+      } catch (RuntimeException e) {
+         Log.errorf(e, "Profile %s (%s) in %s was deleted, but credential(s) %s could not be deleted and the profile "
+               + "could not be restored. These credentials can still log in; delete them manually.",
+               stored.getUserId(), stored.getId(), realmId, credentials);
+      }
+   }
+
+   private com.mongodb.client.MongoCollection<org.bson.Document> profileCollection(String realmId) {
+      var datastore = morphiaDataStoreWrapper.getDataStore(realmId);
+      return datastore.getDatabase().getCollection(
+            datastore.getMapper().getEntityModel(UserProfile.class).collectionName());
    }
 
    /**
@@ -348,12 +438,5 @@ public class UserProfileRepo extends MorphiaRepo<UserProfile> {
       return ref.getEntityId() != null
             ? credentialRepo.findById(ref.getEntityId(), realm)
             : credentialRepo.findByRefName(ref.getEntityRefName(), realm);
-   }
-
-   private void deleteCredential(CredentialUserIdPassword credential, String realm)
-         throws ReferentialIntegrityViolationException {
-      if (credentialRepo.delete(realm, credential) == 0) {
-         throw new IllegalStateException("Failed to delete attached credential " + credential.getId());
-      }
    }
 }

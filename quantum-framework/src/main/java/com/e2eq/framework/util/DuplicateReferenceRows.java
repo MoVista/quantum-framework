@@ -5,6 +5,7 @@ import com.e2eq.framework.model.persistent.morphia.RefNameMatching;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.stream.Collectors;
 
@@ -15,6 +16,9 @@ import java.util.stream.Collectors;
  * row win.
  */
 final class DuplicateReferenceRows {
+
+    /** Row numbers listed in one message; a larger group's message gives the rest as a count. */
+    static final int MAX_LISTED_ROWS = 10;
 
     private final Map<String, List<Integer>> rowsByReference = RefNameMatching.newMap();
 
@@ -32,7 +36,9 @@ final class DuplicateReferenceRows {
     }
 
     /**
-     * Returns an error message for every row whose reference appears in more than one row.
+     * Returns an error message for every row whose reference appears in more than one row. Each
+     * group's message lists at most {@link #MAX_LISTED_ROWS} row numbers, so its size does not grow
+     * with the group, and every row of the group shares the same message instance.
      *
      * @return row number to error message, in ascending row order within each group
      */
@@ -43,12 +49,23 @@ final class DuplicateReferenceRows {
             if (rows.size() < 2) {
                 continue;
             }
-            String message = String.format(
-                    "Reference '%s' appears in rows %s of this file; each reference may appear only once.",
-                    group.getKey(),
-                    rows.stream().sorted().map(String::valueOf).collect(Collectors.joining(", ")));
+            String message = message(group.getKey(), rows);
             rows.forEach(row -> conflicts.put(row, message));
         }
         return conflicts;
+    }
+
+    private static String message(String refName, List<Integer> rows) {
+        String listed = rows.stream().sorted().limit(MAX_LISTED_ROWS).map(String::valueOf)
+                .collect(Collectors.joining(", "));
+        if (rows.size() <= MAX_LISTED_ROWS) {
+            return String.format(
+                    "Reference '%s' appears in rows %s of this file; each reference may appear only once.",
+                    refName, listed);
+        }
+        return String.format(Locale.ROOT,
+                "Reference '%s' appears in %,d rows of this file (rows %s and %,d more); "
+                        + "each reference may appear only once.",
+                refName, rows.size(), listed, rows.size() - MAX_LISTED_ROWS);
     }
 }
