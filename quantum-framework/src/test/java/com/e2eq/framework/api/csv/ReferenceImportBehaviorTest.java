@@ -275,6 +275,62 @@ public class ReferenceImportBehaviorTest extends BaseRepoTest {
     }
 
     @Test
+    public void retryDoesNotMergeOntoAReferenceCreatedDuringTheFailedSave() throws IOException {
+        String first = unique("Stored");
+        String raced = unique("Raced");
+        String imported = unique("Imported");
+        String otherName = unique("Other writer");
+        // The reference-identity unique index, limited to this test's documents.
+        String index = collection().createIndex(new Document("refName", 1).append("dataDomain.tenantId", 1),
+                new com.mongodb.client.model.IndexOptions().name("test_" + imported).unique(true)
+                        .collation(com.e2eq.framework.model.persistent.morphia.RefNameMatching.COLLATION)
+                        .partialFilterExpression(new Document("displayName",
+                                new Document("$in", List.of(imported, otherName)))));
+        try (final SecuritySession ignored = new SecuritySession(pContext, rContext)) {
+            CSVImportHelper.ImportResult<CSVModel> preview = analyze("refName,displayName\n"
+                    + first + "," + imported + "\n" + raced + "," + imported + "\n");
+            try {
+                assertEquals(2, preview.getInsertCount());
+                // Another writer creates the second reference after the commit's lookup and just
+                // before its batch save, which then fails on that reference after storing the first.
+                CSVModel[] other = new CSVModel[1];
+                @SuppressWarnings("unchecked")
+                com.e2eq.framework.model.persistent.morphia.BaseMorphiaRepo<CSVModel> racing =
+                        (com.e2eq.framework.model.persistent.morphia.BaseMorphiaRepo<CSVModel>) java.lang.reflect.Proxy
+                                .newProxyInstance(getClass().getClassLoader(), new Class<?>[]{
+                                        com.e2eq.framework.model.persistent.morphia.BaseMorphiaRepo.class},
+                                        (proxy, method, args) -> {
+                                            if (other[0] == null && method.getName().equals("save") && args.length == 1
+                                                    && args[0] instanceof List) {
+                                                other[0] = saveModel(raced.toUpperCase(), otherName, "kept");
+                                            }
+                                            try {
+                                                return method.invoke(repo, args);
+                                            } catch (java.lang.reflect.InvocationTargetException e) {
+                                                throw e.getCause();
+                                            }
+                                        });
+
+                CSVImportHelper.CommitResult commit = csvImportHelper.commitImport(preview.getSessionId(), racing);
+
+                assertEquals(1, commit.getImported());
+                assertEquals(1, commit.getFailed());
+                assertEquals(1, collection().countDocuments(refFilter(first)));
+                assertEquals(1, collection().countDocuments(refFilter(raced)));
+                CSVModel kept = repo.findByRefName(raced).orElseThrow();
+                assertEquals(other[0].getId(), kept.getId());
+                assertEquals(otherName, kept.getDisplayName(), "the other writer's record is not overwritten");
+            } finally {
+                csvImportHelper.cancelImport(preview.getSessionId());
+            }
+        } finally {
+            collection().dropIndex(index);
+            deleteByRefPattern(first);
+            deleteByRefPattern(raced);
+        }
+    }
+
+    @Test
     public void sessionPreviewStagesRowsByOwnIdentityAndCommitUpdatesInPlace() throws IOException {
         String existingRef = unique("Session");
         String insertedRef = unique("Inserted");

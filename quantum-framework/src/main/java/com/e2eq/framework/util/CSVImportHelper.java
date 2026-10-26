@@ -648,7 +648,8 @@ public class CSVImportHelper {
             ImportResult<T> result, Map<T, Integer> rowNums, Map<T, String> raws, List<String> columns,
             UncarriedColumnWriter<T> uncarriedWriter) {
         int importedBefore = result.getImportedCount();
-        processBatch(repo, batch, failedRecordHandler, result, rowNums, raws, columns, Map.of(), Set.of(), uncarriedWriter);
+        processBatch(repo, batch, failedRecordHandler, result, rowNums, raws, columns, Map.of(), Set.of(), Map.of(),
+                uncarriedWriter);
         result.validRows += result.getImportedCount() - importedBefore;
     }
 
@@ -751,7 +752,8 @@ public class CSVImportHelper {
             Map<T, String> raws,
             List<String> importedColumns) {
 
-        return processBatch(repo, batch, failedRecordHandler, result, rowNums, raws, importedColumns, Map.of(), Set.of(), null);
+        return processBatch(repo, batch, failedRecordHandler, result, rowNums, raws, importedColumns, Map.of(), Set.of(),
+                Map.of(), null);
     }
 
     private <T extends UnversionedBaseModel> ImportResult<T> processBatch(
@@ -762,7 +764,7 @@ public class CSVImportHelper {
             Map<T, Integer> rowNums,
             Map<T, String> raws,
             List<String> importedColumns, Map<T, List<String>> rowColumns, Set<T> stagedInserts,
-            UncarriedColumnWriter<T> uncarriedWriter) {
+            Map<T, ObjectId> attemptedInserts, UncarriedColumnWriter<T> uncarriedWriter) {
 
         if (batch.isEmpty()) return result;
 
@@ -775,8 +777,11 @@ public class CSVImportHelper {
             List<String> columns = rowColumns.getOrDefault(bean, importedColumns);
             boolean columnsKnown = columns != null && !columns.isEmpty();
             T current = bean.getRefName() == null ? null : existing.get(bean.getRefName());
-            if (current != null && stagedInserts.contains(bean)) {
+            if (current != null && stagedInserts.contains(bean)
+                    && !java.util.Objects.equals(current.getId(), attemptedInserts.get(bean))) {
                 // The preview found no such record; merging onto one created since would overwrite it.
+                // Only the record an earlier, failed save of this row stored (with the id that save
+                // gave it) is this row's own.
                 rejectRow(bean, failedRecordHandler, result, rowNums, raws, FieldErrorCode.VALIDATION, format(
                         "Reference '%s' was created after this file was previewed, so this row cannot be inserted. "
                                 + "Preview the file again to update the existing record.", bean.getRefName()));
@@ -862,20 +867,22 @@ public class CSVImportHelper {
                         message != null ? message : "Database write failed.");
 
             } else {
-                // A failed save may have assigned ids to new records; retry them as inserts.
+                // The failed save gave each new record an id and may have stored some of them before
+                // failing. Remember those ids, so a retry recognizes the rows it already stored, then
+                // retry the rest as inserts.
+                Map<T, ObjectId> attempted = new IdentityHashMap<>(attemptedInserts);
+                unidentified.stream().filter(candidate -> candidate.getId() != null)
+                        .forEach(candidate -> attempted.put(candidate, candidate.getId()));
                 unidentified.forEach(candidate -> candidate.setId(null));
                 // Bisect to isolate failing records without losing successes
                 int midPoint = saved.size() / 2;
                 List<T> firstHalf = new ArrayList<>(saved.subList(0, midPoint));
                 List<T> secondHalf = new ArrayList<>(saved.subList(midPoint, saved.size()));
 
-                // The failed save is not atomic: rows before the failing one may already be stored.
-                // Every staged insert here was confirmed absent before that save, so a match found on
-                // retry is this commit's own record and is merged and saved again, not rejected.
                 processBatch(repo, firstHalf, failedRecordHandler, result, rowNums, raws, importedColumns, rowColumns,
-                        Set.of(), uncarriedWriter);
+                        stagedInserts, attempted, uncarriedWriter);
                 processBatch(repo, secondHalf, failedRecordHandler, result, rowNums, raws, importedColumns, rowColumns,
-                        Set.of(), uncarriedWriter);
+                        stagedInserts, attempted, uncarriedWriter);
             }
         }
 
@@ -1328,7 +1335,7 @@ public class CSVImportHelper {
             ImportResult<T> tmp = new ImportResult<>(0, 0);
             processBatch(repo, toSave, rec -> {
             }, tmp, new IdentityHashMap<>(), new IdentityHashMap<>(), session.getImportedColumns(), rowColumns,
-                    stagedInserts, null);
+                    stagedInserts, Map.of(), null);
             logFailedRows(sessionId, tmp);
             session.setStatus("COMMITTED");
             return new CommitResult(tmp.getImportedCount(), tmp.getFailedCount());
@@ -1390,7 +1397,7 @@ public class CSVImportHelper {
             if (!toSave.isEmpty()) {
                 processBatch(repo, toSave, rec -> {
                 }, tmp, rowNums, new IdentityHashMap<>(), session.getImportedColumns(), rowColumns, stagedInserts,
-                        null);
+                        Map.of(), null);
             }
             skip += page.size();
         }
