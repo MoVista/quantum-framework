@@ -5,6 +5,8 @@ import com.e2eq.framework.model.persistent.base.BaseModel;
 import jakarta.validation.ConstraintViolation;
 import jakarta.validation.Validation;
 import jakarta.validation.Validator;
+import jakarta.validation.ValidatorFactory;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
@@ -14,11 +16,19 @@ import static org.junit.jupiter.api.Assertions.*;
 
 class ValidQueryFilterTest {
 
+    private static ValidatorFactory validatorFactory;
     private static Validator validator;
 
     @BeforeAll
     static void setup() {
-        validator = Validation.buildDefaultValidatorFactory().getValidator();
+        // quantum-framework supplies the validator through its service registration.
+        validatorFactory = Validation.buildDefaultValidatorFactory();
+        validator = validatorFactory.getValidator();
+    }
+
+    @AfterAll
+    static void tearDown() {
+        validatorFactory.close();
     }
 
     static class TestModel extends BaseModel {

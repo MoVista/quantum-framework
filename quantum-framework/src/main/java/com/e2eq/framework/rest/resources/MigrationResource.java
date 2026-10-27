@@ -35,6 +35,14 @@ public class MigrationResource {
    @ConfigProperty(name = "quantum.database.migration.enabled", defaultValue = "true")
    boolean enabled;
 
+   /**
+    * Interval between SSE heartbeat comments while a migration call runs. Keeps idle-timeout
+    * proxies (for example a load balancer with a 60 second idle timeout) from dropping the
+    * connection during long silent steps such as index builds. Zero disables heartbeats.
+    */
+   @ConfigProperty(name = "quantum.database.migration.heartbeat-interval", defaultValue = "PT20S")
+   java.time.Duration heartbeatInterval;
+
    @Inject
    MigrationService migrationService;
 
@@ -125,27 +133,8 @@ public class MigrationResource {
       "beanRefName") String beanRefName, SseEventSink eventSink, Sse sse) {
       if (!identity.isAnonymous() && identity.hasRole("admin")) {
 
-         Multi.createFrom().publisher(runChangeBeanTask(beanRefName, realm))
-            .emitOn(managedExecutor)
-            .subscribe().with(
-               message -> {
-                  if (!eventSink.isClosed()) {
-                     eventSink.send(sse.newEvent(message));
-                  }
-               },
-               failure -> {
-                  if (!eventSink.isClosed()) {
-                     eventSink.send(sse.newEvent("Error: " + failure.getMessage()));
-                     eventSink.close();
-                  }
-               },
-               () -> {
-                  if (!eventSink.isClosed()) {
-                     eventSink.send(sse.newEvent("Task completed"));
-                     eventSink.close();
-                  }
-               }
-            );
+         MigrationEventStream.stream(runChangeBeanTask(beanRefName, realm), managedExecutor,
+            MigrationEventStream.Sink.of(eventSink, sse), heartbeatInterval);
       }
    }
 
@@ -156,27 +145,8 @@ public class MigrationResource {
 
       if (!identity.isAnonymous() && identity.hasRole("admin")) {
 
-         Multi.createFrom().publisher(initializeDatabaseTask(realm))
-            .emitOn(managedExecutor)
-            .subscribe().with(
-               message -> {
-                  if (!eventSink.isClosed()) {
-                     eventSink.send(sse.newEvent(message));
-                  }
-               },
-               failure -> {
-                  if (!eventSink.isClosed()) {
-                     eventSink.send(sse.newEvent("Error: " + failure.getMessage()));
-                     eventSink.close();
-                  }
-               },
-               () -> {
-                  if (!eventSink.isClosed()) {
-                     eventSink.send(sse.newEvent("Task completed"));
-                     eventSink.close();
-                  }
-               }
-            );
+         MigrationEventStream.stream(initializeDatabaseTask(realm), managedExecutor,
+            MigrationEventStream.Sink.of(eventSink, sse), heartbeatInterval);
       }
    }
 
@@ -185,27 +155,8 @@ public class MigrationResource {
    @RolesAllowed({"admin", "system"})
    @Produces(MediaType.SERVER_SENT_EVENTS)
    public void startTask (SseEventSink eventSink, Sse sse) {
-      Multi.createFrom().publisher(runMigrateAllTask())
-         .emitOn(managedExecutor)
-         .subscribe().with(
-            message -> {
-               if (!eventSink.isClosed()) {
-                  eventSink.send(sse.newEvent(message));
-               }
-            },
-            failure -> {
-               if (!eventSink.isClosed()) {
-                  eventSink.send(sse.newEvent("Error: " + failure.getMessage()));
-                  eventSink.close();
-               }
-            },
-            () -> {
-               if (!eventSink.isClosed()) {
-                  eventSink.send(sse.newEvent("Task completed"));
-                  eventSink.close();
-               }
-            }
-         );
+      MigrationEventStream.stream(runMigrateAllTask(), managedExecutor,
+         MigrationEventStream.Sink.of(eventSink, sse), heartbeatInterval);
    }
 
    @GET
@@ -213,27 +164,8 @@ public class MigrationResource {
    @RolesAllowed({"admin", "system"})
    @Produces(MediaType.SERVER_SENT_EVENTS)
    public void startSpecificTask (@PathParam("realm") String realm, SseEventSink eventSink, Sse sse) {
-      Multi.createFrom().publisher(runMigrateSpecificTask(realm))
-         .emitOn(managedExecutor)
-         .subscribe().with(
-            message -> {
-               if (!eventSink.isClosed()) {
-                  eventSink.send(sse.newEvent(message));
-               }
-            },
-            failure -> {
-               if (!eventSink.isClosed()) {
-                  eventSink.send(sse.newEvent("Error: " + failure.getMessage()));
-                  eventSink.close();
-               }
-            },
-            () -> {
-               if (!eventSink.isClosed()) {
-                  eventSink.send(sse.newEvent("Task completed"));
-                  eventSink.close();
-               }
-            }
-         );
+      MigrationEventStream.stream(runMigrateSpecificTask(realm), managedExecutor,
+         MigrationEventStream.Sink.of(eventSink, sse), heartbeatInterval);
    }
 
    private Multi<String> initializeDatabaseTask (String realm) {

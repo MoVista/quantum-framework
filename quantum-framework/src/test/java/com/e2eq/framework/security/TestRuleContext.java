@@ -8,12 +8,15 @@ import io.quarkus.test.security.TestSecurity;
 import com.e2eq.framework.model.securityrules.*;
 import com.e2eq.framework.persistent.BaseRepoTest;
 import com.e2eq.framework.security.runtime.RuleContext;
+import com.e2eq.framework.security.runtime.SecuritySession;
 import com.e2eq.framework.util.EnvConfigUtils;
 import com.e2eq.framework.util.IOCase;
 import com.e2eq.framework.util.SecurityUtils;
 import com.e2eq.framework.util.WildCardMatcher;
 
+import dev.morphia.DeleteOptions;
 import dev.morphia.query.filters.Filter;
+import dev.morphia.query.filters.Filters;
 import io.quarkus.logging.Log;
 import io.quarkus.test.junit.QuarkusTest;
 import jakarta.enterprise.context.control.ActivateRequestContext;
@@ -334,50 +337,101 @@ public class TestRuleContext extends BaseRepoTest {
 
         List<Filter> filters = new ArrayList<>();
 
-        // Use the injected RuleContext which should already have seed data loaded via SeedStartupRunner
-        // Ensure it's reloaded from the test realm to get the latest policies including system rules from seed
+        // The seed data no longer has a policy that scopes users to their own resources (the
+        // system-initialize "defaultUserPolicy" was removed), so this test saves its own and removes
+        // it afterwards instead of relying on a policy another test leaves behind.
         String testRealm = testUtils.getTestRealm();
-        injectedRuleContext.reloadFromRepo(testRealm);
+        deletePolicies(testRealm, USER_OWN_RESOURCES_POLICY);
+        try (SecuritySession ignored = new SecuritySession(pContext, rContext)) {
+            policyRepo.save(testRealm, userOwnResourcesPolicy());
+        }
+        try {
+            injectedRuleContext.reloadFromRepo(testRealm);
 
-        // test that an admin can view system admins profile.
-        // Admin should have access via the adminTenantPolicy from seed data
-        SecurityCheckResponse checkRulesResponse = injectedRuleContext.checkRules(systemUserIdPC, sysAdminUserProfileRC);
-        assertTrue(checkRulesResponse.getFinalEffect().equals(RuleEffect.ALLOW),
-                "Admin should be able to view system admin profile via seed-based admin policy");
-        filters = injectedRuleContext.getFilters(filters, systemUserIdPC, sysAdminUserProfileRC, UserProfile.class);
-        logRuleResults("Testing system admin can view the system admin user profile with seed-based rules",
-                systemUserIdPC,
-                sysAdminUserProfileRC,
-                checkRulesResponse,
-                filters);
-//        assertTrue(!filters.isEmpty(), "Admin should have filters applied");
+            // test that an admin can view system admins profile.
+            // Admin should have access via the adminTenantPolicy from seed data
+            SecurityCheckResponse checkRulesResponse = injectedRuleContext.checkRules(systemUserIdPC, sysAdminUserProfileRC);
+            assertTrue(checkRulesResponse.getFinalEffect().equals(RuleEffect.ALLOW),
+                    "Admin should be able to view system admin profile via seed-based admin policy");
+            filters = injectedRuleContext.getFilters(filters, systemUserIdPC, sysAdminUserProfileRC, UserProfile.class);
+            logRuleResults("Testing system admin can view the system admin user profile with seed-based rules",
+                    systemUserIdPC,
+                    sysAdminUserProfileRC,
+                    checkRulesResponse,
+                    filters);
+    //        assertTrue(!filters.isEmpty(), "Admin should have filters applied");
 
-        // test that the admin can view the mingardia user profile.
-        filters.clear();
-        checkRulesResponse = injectedRuleContext.checkRules(systemUserIdPC, mingardiaUserProfileRC);
-        assertTrue(checkRulesResponse.getFinalEffect().equals(RuleEffect.ALLOW),
-                "Admin should be able to view any user profile via seed-based admin policy");
-        filters = injectedRuleContext.getFilters(filters, systemUserIdPC, mingardiaUserProfileRC, UserProfile.class);
-        logRuleResults("Testing system admin can view mingardia user profile with seed-based rules",
-                systemUserIdPC,
-                mingardiaUserProfileRC,
-                checkRulesResponse,
-                filters);
-        //assertTrue(!filters.isEmpty(), "Admin should have filters applied");
+            // test that the admin can view the mingardia user profile.
+            filters.clear();
+            checkRulesResponse = injectedRuleContext.checkRules(systemUserIdPC, mingardiaUserProfileRC);
+            assertTrue(checkRulesResponse.getFinalEffect().equals(RuleEffect.ALLOW),
+                    "Admin should be able to view any user profile via seed-based admin policy");
+            filters = injectedRuleContext.getFilters(filters, systemUserIdPC, mingardiaUserProfileRC, UserProfile.class);
+            logRuleResults("Testing system admin can view mingardia user profile with seed-based rules",
+                    systemUserIdPC,
+                    mingardiaUserProfileRC,
+                    checkRulesResponse,
+                    filters);
+            //assertTrue(!filters.isEmpty(), "Admin should have filters applied");
 
-        //test that user can view their own profile
-        // User should have access via the userOwnResourcesPolicy from seed data
-        filters.clear();
-        checkRulesResponse = injectedRuleContext.checkRules(mingardiaUserIdPC, mingardiaUserProfileRC);
-        assertTrue(checkRulesResponse.getFinalEffect().equals(RuleEffect.ALLOW),
-                "User should be able to view their own profile via seed-based user policy");
-        filters = injectedRuleContext.getFilters(filters, mingardiaUserIdPC, mingardiaUserProfileRC, UserProfile.class);
-        logRuleResults("Testing user can view their own profile with seed-based rules",
-                mingardiaUserIdPC,
-                mingardiaUserProfileRC,
-                checkRulesResponse,
-                filters);
-        assertTrue(!filters.isEmpty(), "User should have filters applied for own resources");
+            //test that user can view their own profile
+            // User should have access via the user-own-resources policy saved above
+            filters.clear();
+            checkRulesResponse = injectedRuleContext.checkRules(mingardiaUserIdPC, mingardiaUserProfileRC);
+            assertTrue(checkRulesResponse.getFinalEffect().equals(RuleEffect.ALLOW),
+                    "User should be able to view their own profile via seed-based user policy");
+            filters = injectedRuleContext.getFilters(filters, mingardiaUserIdPC, mingardiaUserProfileRC, UserProfile.class);
+            logRuleResults("Testing user can view their own profile with seed-based rules",
+                    mingardiaUserIdPC,
+                    mingardiaUserProfileRC,
+                    checkRulesResponse,
+                    filters);
+            assertTrue(!filters.isEmpty(), "User should have filters applied for own resources");
+        } finally {
+            deletePolicies(testRealm, USER_OWN_RESOURCES_POLICY);
+            injectedRuleContext.reloadFromRepo(testRealm);
+        }
+    }
+
+    private static final String USER_OWN_RESOURCES_POLICY = "test-user-own-resources";
+
+    /**
+     * A policy letting the "user" role view resources it owns, filtered to its own documents
+     * (modeled on the former system-initialize "defaultUserPolicy").
+     */
+    private Policy userOwnResourcesPolicy() {
+        Policy policy = new Policy();
+        policy.setRefName(USER_OWN_RESOURCES_POLICY);
+        policy.setDisplayName("Test user own resources policy");
+        policy.setPrincipalId("user");
+        policy.setDataDomain(securityUtils.getSystemDataDomain());
+        SecurityURIHeader header = new SecurityURIHeader.Builder()
+                .withIdentity("user").withArea("*").withFunctionalDomain("*").withAction("view").build();
+        SecurityURIBody body = new SecurityURIBody.Builder()
+                .withRealm("*").withOrgRefName("*").withAccountNumber("*")
+                .withTenantId("*").withOwnerId("*").withDataSegment("*")
+                .withResourceId("*").build();
+        policy.getRules().add(new Rule.Builder()
+                .withName("view-own-resources")
+                .withSecurityURI(new SecurityURI(header, body))
+                .withPostconditionScript("pcontext.getUserId() == rcontext.getOwnerId()")
+                .withAndFilterString("dataDomain.ownerId:${principalId}")
+                .withEffect(RuleEffect.ALLOW)
+                .withPriority(50)
+                .withFinalRule(true)
+                .build());
+        return policy;
+    }
+
+    /**
+     * Removes test policies directly in the datastore (no security rules apply), so a test can
+     * start clean even if an earlier run left one behind.
+     */
+    private void deletePolicies(String realm, String... refNames) {
+        policyRepo.getMorphiaDataStoreWrapper().getDataStore(realm)
+                .find(Policy.class)
+                .filter(Filters.in("refName", List.of(refNames)))
+                .delete(new DeleteOptions().multi(true));
     }
 
     public void logRuleResults(String statement, PrincipalContext principalContext, ResourceContext resourceContext, SecurityCheckResponse securityCheckResponse, List<Filter> filters) {
@@ -447,34 +501,40 @@ public class TestRuleContext extends BaseRepoTest {
         userPolicy.getRules().add(denyDelete);
 
         // Persist and hydrate
+        deletePolicies(realm, "it-user-policy");
         policyRepo.save(realm, userPolicy);
-        injectedRuleContext.reloadFromRepo(realm);
+        try {
+            injectedRuleContext.reloadFromRepo(realm);
 
-        // Build principal and resource contexts
-        String userId = testUtils.getTestUserId();
-        PrincipalContext pctx = new PrincipalContext.Builder()
-                .withDefaultRealm(realm)
-                .withUserId(userId)
-                .withRoles(new String[]{"user"})
-                .withDataDomain(testUtils.getTestDataDomain())
-                .withScope("AUTHENTICATED")
-                .build();
+            // Build principal and resource contexts
+            String userId = testUtils.getTestUserId();
+            PrincipalContext pctx = new PrincipalContext.Builder()
+                    .withDefaultRealm(realm)
+                    .withUserId(userId)
+                    .withRoles(new String[]{"user"})
+                    .withDataDomain(testUtils.getTestDataDomain())
+                    .withScope("AUTHENTICATED")
+                    .build();
 
-        // View own userProfile should ALLOW
-        ResourceContext ownProfileView = new ResourceContext.Builder()
-                .withArea("security").withFunctionalDomain("userProfile").withAction("view")
-                .withOwnerId(userId).withResourceId("R1").build();
-        SecurityCheckResponse resp = injectedRuleContext.checkRules(pctx, ownProfileView);
-        assertEquals(RuleEffect.ALLOW, resp.getFinalEffect());
-        List<Filter> viewFilters = injectedRuleContext.getFilters(new ArrayList<>(), pctx, ownProfileView, UserProfile.class);
-        assertFalse(viewFilters.isEmpty(), "Expected filters contributed by allow rule");
+            // View own userProfile should ALLOW
+            ResourceContext ownProfileView = new ResourceContext.Builder()
+                    .withArea("security").withFunctionalDomain("userProfile").withAction("view")
+                    .withOwnerId(userId).withResourceId("R1").build();
+            SecurityCheckResponse resp = injectedRuleContext.checkRules(pctx, ownProfileView);
+            assertEquals(RuleEffect.ALLOW, resp.getFinalEffect());
+            List<Filter> viewFilters = injectedRuleContext.getFilters(new ArrayList<>(), pctx, ownProfileView, UserProfile.class);
+            assertFalse(viewFilters.isEmpty(), "Expected filters contributed by allow rule");
 
-        // Try to delete something in security area should DENY
-        ResourceContext deleteAttempt = new ResourceContext.Builder()
-                .withArea("security").withFunctionalDomain("userProfile").withAction("delete")
-                .withOwnerId(userId).withResourceId("R2").build();
-        resp = injectedRuleContext.checkRules(pctx, deleteAttempt);
-        assertEquals(RuleEffect.DENY, resp.getFinalEffect());
+            // Try to delete something in security area should DENY
+            ResourceContext deleteAttempt = new ResourceContext.Builder()
+                    .withArea("security").withFunctionalDomain("userProfile").withAction("delete")
+                    .withOwnerId(userId).withResourceId("R2").build();
+            resp = injectedRuleContext.checkRules(pctx, deleteAttempt);
+            assertEquals(RuleEffect.DENY, resp.getFinalEffect());
+        } finally {
+            deletePolicies(realm, "it-user-policy");
+            injectedRuleContext.reloadFromRepo(realm);
+        }
     }
 
     @Test
@@ -505,21 +565,27 @@ public class TestRuleContext extends BaseRepoTest {
                 .build();
         adminPolicy.getRules().add(adminAllowAll);
 
+        deletePolicies(realm, "it-admin-policy");
         policyRepo.save(realm, adminPolicy);
-        injectedRuleContext.reloadFromRepo(realm);
+        try {
+            injectedRuleContext.reloadFromRepo(realm);
 
-        // Build principal and a random resource context
-        PrincipalContext admin = new PrincipalContext.Builder()
-                .withDefaultRealm(realm)
-                .withUserId(testUtils.getSystemUserId())
-                .withRoles(new String[]{"admin"})
-                .withDataDomain(testUtils.getSystemDataDomain())
-                .withScope("AUTHENTICATED")
-                .build();
-        ResourceContext anyRc = new ResourceContext.Builder()
-                .withArea("sales").withFunctionalDomain("orders").withAction("update")
-                .withOwnerId(testUtils.getSystemUserId()).withResourceId("ORDER-1").build();
-        SecurityCheckResponse resp = injectedRuleContext.checkRules(admin, anyRc);
-        assertEquals(RuleEffect.ALLOW, resp.getFinalEffect());
+            // Build principal and a random resource context
+            PrincipalContext admin = new PrincipalContext.Builder()
+                    .withDefaultRealm(realm)
+                    .withUserId(testUtils.getSystemUserId())
+                    .withRoles(new String[]{"admin"})
+                    .withDataDomain(testUtils.getSystemDataDomain())
+                    .withScope("AUTHENTICATED")
+                    .build();
+            ResourceContext anyRc = new ResourceContext.Builder()
+                    .withArea("sales").withFunctionalDomain("orders").withAction("update")
+                    .withOwnerId(testUtils.getSystemUserId()).withResourceId("ORDER-1").build();
+            SecurityCheckResponse resp = injectedRuleContext.checkRules(admin, anyRc);
+            assertEquals(RuleEffect.ALLOW, resp.getFinalEffect());
+        } finally {
+            deletePolicies(realm, "it-admin-policy");
+            injectedRuleContext.reloadFromRepo(realm);
+        }
     }
 }

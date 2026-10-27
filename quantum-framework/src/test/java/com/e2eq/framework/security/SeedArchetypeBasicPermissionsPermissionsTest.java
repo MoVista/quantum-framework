@@ -4,7 +4,14 @@ import com.e2eq.framework.model.persistent.base.DataDomain;
 import com.e2eq.framework.model.securityrules.*;
 import com.e2eq.framework.persistent.BaseRepoTest;
 import com.e2eq.framework.seeds.ArchetypeSeeder;
+import com.e2eq.framework.model.persistent.morphia.MorphiaDataStoreWrapper;
+import com.e2eq.framework.model.security.CredentialUserIdPassword;
+import com.e2eq.framework.model.security.Policy;
+import com.e2eq.framework.model.security.UserProfile;
 import com.e2eq.framework.security.runtime.RuleContext;
+import dev.morphia.DeleteOptions;
+import dev.morphia.MorphiaDatastore;
+import dev.morphia.query.filters.Filters;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.security.TestSecurity;
 import jakarta.enterprise.context.control.ActivateRequestContext;
@@ -12,6 +19,8 @@ import jakarta.inject.Inject;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -29,6 +38,9 @@ public class SeedArchetypeBasicPermissionsPermissionsTest extends BaseRepoTest {
     @Inject
     RuleContext ruleContext;
 
+    @Inject
+    MorphiaDataStoreWrapper morphiaDataStoreWrapper;
+
     private String realm;
     private DataDomain tenantDd;
 
@@ -42,9 +54,41 @@ public class SeedArchetypeBasicPermissionsPermissionsTest extends BaseRepoTest {
         ArchetypeSeeder.importArchetype("basic-permissions-v1-test", realm, tenantDd, true);
     }
 
+    /** Policies the basic-permissions-v1 archetype creates in the test realm. */
+    private static final List<String> ARCHETYPE_POLICIES = List.of(
+            "user-login-allow", "user-userprofile-self", "browse-public",
+            "user-delete-deny", "power-user-standard", "tenant-admin-full");
+
+    /** Users the archetype creates, with a profile in the test realm and credentials. */
+    private static final List<String> ARCHETYPE_USERS = List.of(
+            "test-user@end2endlogic.com", "power-user@end2endlogic.com", "tenant-admin@end2endlogic.com");
+
     @AfterEach
     public void clear() {
         SecurityContext.clear();
+        removeArchetypeData();
+    }
+
+    /**
+     * Removes what the archetype import created, so its policies do not take part in other tests'
+     * rule evaluation in the shared test realm. Functional domains are left in place: the import
+     * merges actions into domains other seeds also define. Deletes go directly to the datastores,
+     * so no security rules apply.
+     */
+    private void removeArchetypeData() {
+        MorphiaDatastore testRealm = morphiaDataStoreWrapper.getDataStore(realm);
+        testRealm.find(Policy.class)
+                .filter(Filters.in("refName", ARCHETYPE_POLICIES))
+                .delete(new DeleteOptions().multi(true));
+        testRealm.find(UserProfile.class)
+                .filter(Filters.in("userId", ARCHETYPE_USERS))
+                .delete(new DeleteOptions().multi(true));
+        for (String credentialRealm : List.of(realm, testUtils.getSystemRealm())) {
+            morphiaDataStoreWrapper.getDataStore(credentialRealm).find(CredentialUserIdPassword.class)
+                    .filter(Filters.in("userId", ARCHETYPE_USERS))
+                    .delete(new DeleteOptions().multi(true));
+        }
+        ruleContext.reloadFromRepo(realm);
     }
 
     private PrincipalContext pc(String userId, String... roles) {

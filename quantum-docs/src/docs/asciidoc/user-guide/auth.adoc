@@ -453,6 +453,13 @@ When you call `POST /auth/service-token`, the framework:
 5. **Links it to the caller's UserProfile** via `additionalCredentialRefs` so the token can be traced to its creator.
 6. **Signs and returns the JWT**.
 
+==== Deleting a User Profile
+
+Deleting a `UserProfile` also deletes the credentials it references: its service tokens and other `additionalCredentialRefs` first, then its primary login (`credentialUserIdPasswordRef`). Each credential is deleted under the caller's own permission rules; deleting a profile never grants access to a credential.
+
+* If a referenced credential exists but the caller's rules hide it (for example, a tenant's initial admin login stamped with the provisioning tenant), the delete is refused with a `ReferentialIntegrityViolationException` and nothing is deleted. A caller whose rules reach that credential, such as a system administrator, must delete the profile.
+* If a credential delete fails after the profile was deleted, the profile is restored and the error is returned, so the delete can be retried. The primary login is deleted last, so it survives a failure on any other credential.
+
 ==== Using a Service Token
 
 The service token is used like any other JWT -- pass it in the `Authorization` header:

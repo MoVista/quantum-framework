@@ -26,16 +26,27 @@ import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 
-import static dev.morphia.mapping.IndexType.DESC;
 
+/*
+ * Reference identity: a refName is unique per tenant within a collection, compared
+ * case-insensitively. Two indexes share the same keys:
+ *  - idx_refNameTenant_unique enforces uniqueness with English strength-2 collation and serves
+ *    queries that run with that collation (the central reference lookups and sorted lists).
+ *  - idx_refNameTenant_lookup is non-unique with the collection's default (simple) collation, so
+ *    queries that do not specify a collation can still use an index.
+ * Neither _t, orgRefName, nor ownerId is part of the identity: EntityReference values resolve by
+ * entityRefName without a type, and owners or organizations must not be able to reuse a reference.
+ */
 @Entity
 //@EntityListeners({ReferenceInterceptor.class, ValidationInterceptor.class, AuditInterceptor.class})
 @Indexes({
-            @Index(fields={@Field( value="refName", type=DESC),
-                    @Field(value="dataDomain.orgRefName", type=DESC),
-                    @Field(value="dataDomain.tenantId", type=DESC),
-                    @Field(value="dataDomain.ownerId", type=DESC)},
-                   options=@IndexOptions(unique=true, collation = @Collation(locale = "en", strength = CollationStrength.SECONDARY), name = "idx_refIdUniqueInDomain")
+            @Index(fields={@Field(value="refName"),
+                    @Field(value="dataDomain.tenantId")},
+                   options=@IndexOptions(unique=true, collation = @Collation(locale = "en", strength = CollationStrength.SECONDARY), name = UnversionedBaseModel.REF_NAME_TENANT_UNIQUE_INDEX)
+                  ),
+            @Index(fields={@Field(value="refName"),
+                    @Field(value="dataDomain.tenantId")},
+                   options=@IndexOptions(name = UnversionedBaseModel.REF_NAME_TENANT_LOOKUP_INDEX)
                   )
 })
 @RegisterForReflection
@@ -45,6 +56,15 @@ import static dev.morphia.mapping.IndexType.DESC;
 @NoArgsConstructor
 @JsonIgnoreProperties({"bmFunctionalArea","bmFunctionalDomain"})
 public abstract  class UnversionedBaseModel {
+
+    /** Name of the case-insensitive unique index on {@code {refName, dataDomain.tenantId}}. */
+    public static final String REF_NAME_TENANT_UNIQUE_INDEX = "idx_refNameTenant_unique";
+
+    /** Name of the non-unique, simple-collation lookup index on {@code {refName, dataDomain.tenantId}}. */
+    public static final String REF_NAME_TENANT_LOOKUP_INDEX = "idx_refNameTenant_lookup";
+
+    /** Name of the reference index this model declared before the reference-identity rework. */
+    public static final String LEGACY_REF_NAME_INDEX = "idx_refIdUniqueInDomain";
 
     @Id
     @Schema(implementation = String.class, description = "MongoDB ObjectId as String")

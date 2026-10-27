@@ -259,7 +259,7 @@ public class PolicyResource extends BaseResource<Policy, PolicyRepo>{
          throw new IllegalArgumentException("principalId is required");
       }
 
-      Optional<Policy> existing = repo.findByRefName(realm, item.refName);
+      Optional<Policy> existing = repo.findByRefName(item.refName, realm);
       Policy policy = existing.orElseGet(Policy::new);
       boolean created = existing.isEmpty();
 

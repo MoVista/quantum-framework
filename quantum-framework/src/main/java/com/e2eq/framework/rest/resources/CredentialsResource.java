@@ -11,6 +11,7 @@ import com.e2eq.framework.rest.models.RestError;
 import com.e2eq.framework.rest.models.SuccessResponse;
 import com.e2eq.framework.model.security.CredentialUserIdPassword;
 import com.e2eq.framework.model.persistent.morphia.CredentialRepo;
+import com.e2eq.framework.csv.CSVImportHelper;
 import jakarta.inject.Inject;
 import jakarta.annotation.security.RolesAllowed;
 import jakarta.ws.rs.*;
@@ -18,6 +19,10 @@ import jakarta.ws.rs.core.*;
 import org.eclipse.microprofile.openapi.annotations.Operation;
 import org.eclipse.microprofile.openapi.annotations.parameters.Parameter;
 import org.eclipse.microprofile.openapi.annotations.tags.Tag;
+import org.eclipse.microprofile.openapi.annotations.responses.APIResponse;
+import org.eclipse.microprofile.openapi.annotations.responses.APIResponses;
+import org.eclipse.microprofile.openapi.annotations.media.Content;
+import org.eclipse.microprofile.openapi.annotations.media.Schema;
 
 import com.e2eq.framework.rest.models.RealmInfo;
 
@@ -56,6 +61,57 @@ public class CredentialsResource extends BaseResource<CredentialUserIdPassword, 
             @Parameter(description = "A non-empty list of the names of the columns expected in the CSV file that map to the model fields")
             @QueryParam("requestedColumns") List<String> requestedColumns) {
         return super.importCSVList(info, fileUpload, fieldSeparator,quotingStrategy, quoteChar, skipHeaderRow, charsetEncoding, requestedColumns);
+    }
+
+    @Override
+    @POST
+    @Path("csv/session")
+    @Consumes(MediaType.MULTIPART_FORM_DATA)
+    @Produces(MediaType.APPLICATION_JSON)
+    @Operation(summary = "Disabled: credential CSV session preview", description = CSVImportHelper.CREDENTIAL_DIRECT_IMPORT_REQUIRED)
+    @APIResponses(@APIResponse(responseCode = "400", description = CSVImportHelper.CREDENTIAL_DIRECT_IMPORT_REQUIRED,
+            content = @Content(schema = @Schema(implementation = RestError.class))))
+    public Response createCsvImportSession(
+            @Context UriInfo info, @BeanParam FileUpload fileUpload,
+            @QueryParam("fieldSeparator") @DefaultValue(",") String fieldSeparator,
+            @QueryParam("quotingStrategy") @DefaultValue("QUOTE_WHERE_ESSENTIAL") String quotingStrategy,
+            @QueryParam("quoteChar") @DefaultValue("\"") String quoteChar,
+            @QueryParam("skipHeaderRow") @DefaultValue("true") boolean skipHeaderRow,
+            @QueryParam("charsetEncoding") @DefaultValue("UTF-8-without-BOM") String charsetEncoding,
+            @QueryParam("requestedColumns") List<String> requestedColumns) {
+        return rejectSessionImport();
+    }
+
+    @Override
+    @POST
+    @Path("csv/session/profile")
+    @Consumes(MediaType.MULTIPART_FORM_DATA)
+    @Produces(MediaType.APPLICATION_JSON)
+    @Operation(summary = "Disabled: credential CSV profile session preview", description = CSVImportHelper.CREDENTIAL_DIRECT_IMPORT_REQUIRED)
+    @APIResponses(@APIResponse(responseCode = "400", description = CSVImportHelper.CREDENTIAL_DIRECT_IMPORT_REQUIRED,
+            content = @Content(schema = @Schema(implementation = RestError.class))))
+    public Response createCsvImportSessionWithProfile(
+            @Context HttpHeaders headers, @Context UriInfo info, @BeanParam FileUpload fileUpload,
+            @QueryParam("profileRefName") String profileRefName,
+            @QueryParam("requestedColumns") List<String> requestedColumns) {
+        return rejectSessionImport();
+    }
+
+    @Override
+    @POST
+    @Path("csv/session/{sessionId}/commit")
+    @Produces(MediaType.APPLICATION_JSON)
+    @Operation(summary = "Disabled: credential CSV session commit", description = CSVImportHelper.CREDENTIAL_DIRECT_IMPORT_REQUIRED)
+    @APIResponses(@APIResponse(responseCode = "400", description = CSVImportHelper.CREDENTIAL_DIRECT_IMPORT_REQUIRED,
+            content = @Content(schema = @Schema(implementation = RestError.class))))
+    public Response commitCsvImportSession(@PathParam("sessionId") String sessionId) {
+        return rejectSessionImport();
+    }
+
+    private Response rejectSessionImport() {
+        return Response.status(Response.Status.BAD_REQUEST).entity(RestError.builder()
+                .status(Response.Status.BAD_REQUEST.getStatusCode())
+                .statusMessage(CSVImportHelper.CREDENTIAL_DIRECT_IMPORT_REQUIRED).build()).build();
     }
 
 

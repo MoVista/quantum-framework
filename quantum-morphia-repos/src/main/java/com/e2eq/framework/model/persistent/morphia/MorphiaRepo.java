@@ -110,7 +110,7 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
     @ConfigProperty(name = "quantum.morphia.maxSkippedUnparseableDocuments", defaultValue = "1000")
     protected int maxSkippedUnparseableDocuments;
 
-    private void callPostPersistHooks(String realmId, Object entity) {
+    protected void callPostPersistHooks(String realmId, Object entity) {
         lifecycleHooks().callPostPersistHooks(realmId, entity);
     }
 
@@ -254,7 +254,7 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
     public void ensureIndexes (String realmId, String collection) {
       Objects.requireNonNull(realmId, "RealmId cannot be null");
       Objects.requireNonNull(collection, "Collection cannot be null");
-      morphiaDataStoreWrapper.getDataStore(realmId).ensureIndexes(getPersistentClass());
+      DeclaredIndexes.ensure(morphiaDataStoreWrapper.getDataStore(realmId), getPersistentClass());
    }
 
 
@@ -344,18 +344,21 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
     public Optional<T> findByRefName(@NotNull Datastore datastore, @NotNull String refName, boolean ignoreRules) {
         Objects.requireNonNull(refName, "the refName can not be null");
 
+        // Match the reference like the reference-identity unique index ("abc" finds "ABC"), then
+        // load the matches with the secured filters under the default collation, so permission
+        // predicates keep their exact comparisons.
         List<Filter> filters = new ArrayList<>();
-        filters.add(Filters.eq("refName", refName));
-        // Add filters based upon rule and resourceContext;
-       Filter[] qfilters = new Filter[1];;
+        filters.add(Filters.in("_id", idsMatchingRefNames(datastore, List.of(refName))));
+        // Add filters based upon rule and resourceContext; building them first also resolves a
+        // missing principal from the request identity before the tenant check below.
        if (!ignoreRules) {
-          qfilters = getFilterArray(filters, getPersistentClass());
-       } else {
-          qfilters = filters.toArray(qfilters);
+          filters = new ArrayList<>(Arrays.asList(getFilterArray(filters, getPersistentClass())));
        }
+       addSharedReferenceTenantFilter(datastore, filters);
 
-        Query<T> query = datastore.find(getPersistentClass()).filter(combineForMorphiaQuery(qfilters));
-        T obj = query.first();
+        Query<T> query = datastore.find(getPersistentClass()).filter(combineForMorphiaQuery(filters));
+        List<T> matches = toListSkippingUnparseable(datastore, query, new FindOptions());
+        T obj = matches.size() > 1 ? resolveAmbiguousRefName(datastore, refName, matches) : matches.stream().findFirst().orElse(null);
 
         if (obj != null) {
             UIActionList uiActions = obj.calculateStateBasedUIActions();
@@ -364,6 +367,80 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
         }
 
         return Optional.ofNullable(obj);
+    }
+
+    /**
+     * Reference identity in the shared system database is scoped to the calling tenant, except for
+     * entities marked {@link GlobalReferenceIdentity}.
+     */
+    private void addSharedReferenceTenantFilter(Datastore datastore, List<Filter> filters) {
+        if (!getPersistentClass().isAnnotationPresent(GlobalReferenceIdentity.class)
+                && envConfigUtils != null && envConfigUtils.getSystemRealm().equals(datastore.getDatabase().getName())) {
+            String tenantId = SecurityContext.getPrincipalContext()
+                    .map(PrincipalContext::getDataDomain).map(DataDomain::getTenantId).orElse(null);
+            if (tenantId == null) {
+                throw new IllegalStateException("A tenant context is required for a shared-database reference lookup");
+            }
+            filters.add(Filters.eq("dataDomain.tenantId", tenantId));
+        }
+    }
+
+    /**
+     * Ids of the documents whose reference matches one of {@code refNames}, compared like the
+     * reference-identity unique index. Only the reference is compared under that collation;
+     * callers load the documents by id with their secured filters, so permission predicates keep
+     * the default, exact comparison.
+     */
+    private List<ObjectId> idsMatchingRefNames(Datastore datastore, List<String> refNames) {
+        List<ObjectId> ids = new ArrayList<>();
+        if (refNames == null || refNames.isEmpty()) {
+            return ids;
+        }
+        // A Morphia query, so a lookup through a session datastore runs in its transaction.
+        FindOptions options = new FindOptions().collation(RefNameMatching.COLLATION).projection().include("_id");
+        try (MorphiaCursor<T> cursor = datastore.find(getPersistentClass())
+                .filter(Filters.in("refName", refNames)).iterator(options)) {
+            cursor.forEachRemaining(match -> {
+                if (match.getId() != null) {
+                    ids.add(match.getId());
+                }
+            });
+        }
+        return ids;
+    }
+
+    /**
+     * Chooses one document when a reference lookup matches more than one. The reference-identity
+     * index allows one document per reference per tenant, so several matches mean a collection
+     * shared by tenants (the system realm) or duplicates created before the index existed. The
+     * caller's tenant is preferred, then an exact-case match, then the first match.
+     *
+     * @param datastore the datastore the lookup ran against
+     * @param refName the requested reference
+     * @param matches every document the original lookup matched, at least two
+     * @return the chosen document
+     */
+    private T resolveAmbiguousRefName(Datastore datastore, String refName, List<T> matches) {
+        String tenantId = SecurityContext.getPrincipalContext()
+                .map(PrincipalContext::getDataDomain)
+                .map(DataDomain::getTenantId)
+                .orElse(null);
+        List<T> candidates = matches;
+        if (tenantId != null) {
+            List<T> tenantMatches = matches.stream()
+                    .filter(match -> match.getDataDomain() != null
+                            && tenantId.equals(match.getDataDomain().getTenantId()))
+                    .toList();
+            if (!tenantMatches.isEmpty()) {
+                candidates = tenantMatches;
+                if (candidates.size() > 1) {
+                    Log.warnf("Reference %s matches more than one %s in tenant %s of %s; duplicates must be reconciled",
+                            refName, getPersistentClass().getSimpleName(), tenantId, datastore.getDatabase().getName());
+                }
+            }
+        }
+        return candidates.stream().filter(match -> refName.equals(match.getRefName())).findFirst()
+                .orElse(candidates.get(0));
     }
 
 
@@ -977,7 +1054,11 @@ public  abstract class MorphiaRepo<T extends UnversionedBaseModel> implements Ba
         List<Filter> filters = new ArrayList<>();
         filters = securityFilterBuilder().buildSecuredFilters(filters, getPersistentClass());
 
-        filters.add(Filters.in("refName", refNames));
+        // References match like the reference-identity unique index, so returned refNames may
+        // differ in case from the requested ones: match results with RefNameMatching rather than
+        // equals(). The secured filters keep the default, exact comparison.
+        filters.add(Filters.in("_id", idsMatchingRefNames(datastore, refNames)));
+        addSharedReferenceTenantFilter(datastore, filters);
 
         FindOptions findOptions = new FindOptions();
 

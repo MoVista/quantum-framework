@@ -55,6 +55,17 @@ public class MorphiaDataStoreWrapper {
 
    protected static final boolean ENABLE_ONE_DB_PER_TENANT = false;
 
+   @org.eclipse.microprofile.config.inject.ConfigProperty(name = DeclaredIndexConfigInterceptor.REQUESTED, defaultValue = "false")
+   boolean createDeclaredIndexes;
+
+   @jakarta.annotation.PostConstruct
+   void applyBaseDeclaredIndexes() {
+      if (createDeclaredIndexes) {
+         // Runs before migrations; a failure is logged and retried by the post-migration step.
+         DeclaredIndexes.ensureAllTolerating(dataStore);
+      }
+   }
+
    public MorphiaDataStoreWrapper () {
    }
 
@@ -76,7 +87,7 @@ public class MorphiaDataStoreWrapper {
 
       // Clone the MorphiaConfig and override the database
       MorphiaConfig baseConfig = dataStore.getMapper().getConfig();
-      MorphiaConfig configForRealm = baseConfig.database(realm);
+      MorphiaConfig configForRealm = baseConfig.database(realm).applyIndexes(false);
 
       MorphiaDatastore mdatastore = new MorphiaDatastore(mongoClient, configForRealm);
 
@@ -92,9 +103,11 @@ public class MorphiaDataStoreWrapper {
          mdatastore.getMapper().map(entityType);
       }
 
-      // Apply indexes and document validations
-      if (baseConfig.applyIndexes()) {
-         mdatastore.applyIndexes();
+      // Apply indexes and document validations. This runs before the realm's migrations, which may
+      // be what repairs data blocking an index, so a failure must not stop the datastore from
+      // being created and cached; the post-migration index step retries and reports it.
+      if (createDeclaredIndexes) {
+         DeclaredIndexes.ensureAllTolerating(mdatastore);
       }
 
       if (baseConfig.applyDocumentValidations()) {

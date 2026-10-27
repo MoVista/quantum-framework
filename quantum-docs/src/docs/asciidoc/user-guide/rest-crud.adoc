@@ -302,7 +302,9 @@ Behavior:
 
 * Each row is parsed into a model instance using type‑aware processors (ints, longs, decimals, enums, etc.).
 * Bean Validation is applied; rows with violations are collected as errors and not saved; valid rows are batched and saved.
-* For each saved batch, insert vs update is determined by refName presence in the repository.
+* Insert vs update is determined by whether the row's refName already exists. References are compared case-insensitively, like the `idx_refNameTenant_unique` index, so a row for `abc` updates an existing `ABC`.
+* An update changes only the requested columns of the existing document and saves it through the normal save path. The document's id, refName spelling, ownership (`dataDomain`), audit creation fields, version, and every column not in the file are preserved. A blank cell in a requested column clears that property; a nested column such as `address.city` changes only that property; a list column (`tags[0]`) replaces the whole list.
+* A reference may appear only once per file. Every row of a group that shares a reference (compared case-insensitively) is rejected with a row error naming the rows, rather than the first or last row winning. The whole file is read before anything is saved.
 * Response entity includes counts (importedCount, failedCount) and per‑row results when available.
 * Response headers:
   - X-Import-Success-Count: number of rows successfully imported.
@@ -330,6 +332,8 @@ Use a two‑step flow to analyze first, then commit only valid rows.
 
 * POST /csv/session/{sessionId}/commit: imports only error‑free rows from the analyzed session
   - Returns CommitResult with inserted/updated counts.
+  - Updates follow the same rules as direct import. The session records its requested columns (`importedColumns`). A session without them (one created by custom preview code that does not set them) cannot update existing records: each UPDATE row fails with a row error instead of guessing which properties the file supplied.
+  - Rows whose reference repeats within the file are marked as errors during analysis and are not committed.
 
 - DELETE /csv/session/{sessionId}: cancels and discards session state (idempotent; always returns 204).
 
@@ -338,6 +342,7 @@ Use a two‑step flow to analyze first, then commit only valid rows.
     - skip (default 0), limit (default 50)
     - onlyErrors (default false): when true, returns only rows with errors
     - intent (optional): filter rows by intended action: INSERT, UPDATE, or SKIP
+  - Each staged row's `refName` is its own staging identity, `<sessionId>:<rowNumber>`, so the same target can be staged by several sessions or users at once. The reference of the document the row would insert or update is in `targetRefName`. The `refName` in preview and commit row results (`rowResults`) is still the target reference.
 
 Notes and constraints:
 

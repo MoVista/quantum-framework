@@ -371,12 +371,12 @@ public class TenantProvisioningService {
            Log.info("No Archetypes applicable");
         }
 
-        // 6) Idempotent: Apply indexes and verify (under tenant migration context)
-        withDropPendingRetry(realmId, "apply indexes and verify initialization", () ->
-                SecurityCallScope.runWithContexts(tenantPrincipal, migrationResource, () -> {
-                    migrationService.applyIndexes(realmId);
-                    migrationService.checkInitialized(realmId);
-                })
+        // 6) Verify initialization (under tenant migration context). Declared indexes were already
+        //    applied by the migration call in step 3, before seeding, so seed data was checked
+        //    against the unique indexes.
+        withDropPendingRetry(realmId, "verify initialization", () ->
+                SecurityCallScope.runWithContexts(tenantPrincipal, migrationResource, () ->
+                        migrationService.checkInitialized(realmId))
         );
 
         return result;

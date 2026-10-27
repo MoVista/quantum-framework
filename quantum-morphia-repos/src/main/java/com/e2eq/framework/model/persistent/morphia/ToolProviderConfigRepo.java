@@ -25,7 +25,7 @@ public class ToolProviderConfigRepo {
         return ds.save(config);
     }
 
-    public Optional<ToolProviderConfig> findByRefName(String realm, String refName) {
+    public Optional<ToolProviderConfig> findByRefName(String refName, String realm) {
         if (realm == null || refName == null || refName.isBlank()) {
             return Optional.empty();
         }
