@@ -34,7 +34,7 @@ import org.junit.jupiter.api.Test;
  * MOV-12871: DELETE with X-Realm must look up (key, realm), matching MorphiaRepo.
  */
 @QuarkusTest
-public class BaseResourceXRealmDeleteIT extends BaseRepoTest {
+public class BaseResourceXRealmDeleteTest extends BaseRepoTest {
 
     private static final String FLAGS = "/features/flags";
 
