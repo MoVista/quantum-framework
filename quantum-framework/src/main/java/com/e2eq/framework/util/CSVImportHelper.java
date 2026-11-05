@@ -18,6 +18,7 @@ import com.e2eq.framework.model.persistent.imports.ParsedHeader;
 import com.e2eq.framework.model.persistent.morphia.BaseMorphiaRepo;
 import com.e2eq.framework.model.persistent.morphia.ImportSessionRepo;
 import com.e2eq.framework.model.persistent.morphia.RefNameMatching;
+import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.e2eq.framework.model.persistent.base.DataDomain;
@@ -236,6 +237,10 @@ public class CSVImportHelper {
         private String field; // may be null if unknown
         private String message;
         private FieldErrorCode code; // e.g., VALIDATION, PARSE, MAPPING, DB
+        @JsonInclude(JsonInclude.Include.NON_EMPTY)
+        private String messageKey; // optional; lets a client translate the message
+        @JsonInclude(JsonInclude.Include.NON_EMPTY)
+        private Map<String, String> params; // optional values for the messageKey's placeholders
 
         public FieldError() {
         }
@@ -244,6 +249,13 @@ public class CSVImportHelper {
             this.field = field;
             this.message = message;
             this.code = code;
+        }
+
+        public FieldError(String field, String message, FieldErrorCode code, String messageKey,
+                          Map<String, String> params) {
+            this(field, message, code);
+            this.messageKey = messageKey;
+            this.params = params;
         }
 
     }
