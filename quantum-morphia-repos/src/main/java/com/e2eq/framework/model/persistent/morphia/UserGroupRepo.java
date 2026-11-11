@@ -21,7 +21,7 @@ public class UserGroupRepo extends MorphiaRepo<UserGroup> {
       String query = String.format("userProfiles.entityRefName:\"%s\"", userProfileRef.getEntityRefName());
       List<UserGroup> userGroups =  getListByQuery(0, -1, query);
       if (userGroups.isEmpty()) {
-         Log.warnf("No userGroups found for userProfileRef:\"%s\"", userProfileRef.getEntityRefName());
+         Log.debugf("No userGroups found for userProfileRef:\"%s\"", userProfileRef.getEntityRefName());
       }
       return userGroups;
    }
@@ -49,7 +49,7 @@ public class UserGroupRepo extends MorphiaRepo<UserGroup> {
       List<UserGroup> userGroups = query.iterator().toList();
 
       if (userGroups.isEmpty()) {
-         Log.warnf("No userGroups found for userProfileRef:\"%s\" in realm:%s (ignoreRules=true)", userProfileRef.getEntityRefName(), realm);
+         Log.debugf("No userGroups found for userProfileRef:\"%s\" in realm:%s (ignoreRules=true)", userProfileRef.getEntityRefName(), realm);
       } else {
          Log.debugf("Found %d userGroups for userProfileRef:\"%s\" in realm:%s (ignoreRules=true)", userGroups.size(), userProfileRef.getEntityRefName(), realm);
       }
@@ -66,7 +66,7 @@ public class UserGroupRepo extends MorphiaRepo<UserGroup> {
       Log.debugf("UserGroupRepo.findByUserProfileRef: querying realm=%s for userProfileRef=%s", realm, userProfileRef.getEntityRefName());
       List<UserGroup> userGroups = getListByQuery(realm, 0, -1, query, null, null);
       if (userGroups.isEmpty()) {
-         Log.warnf("No userGroups found for userProfileRef:\"%s\" in realm:%s", userProfileRef.getEntityRefName(), realm);
+         Log.debugf("No userGroups found for userProfileRef:\"%s\" in realm:%s", userProfileRef.getEntityRefName(), realm);
       } else {
          Log.debugf("Found %d userGroups for userProfileRef:\"%s\" in realm:%s", userGroups.size(), userProfileRef.getEntityRefName(), realm);
       }
