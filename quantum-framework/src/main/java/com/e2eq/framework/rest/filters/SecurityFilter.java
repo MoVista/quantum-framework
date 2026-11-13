@@ -654,6 +654,49 @@ public class SecurityFilter implements ContainerRequestFilter, jakarta.ws.rs.con
         }
     }
 
+    /**
+     * Builds the {@link PrincipalContext} for the current {@link SecurityIdentity} outside a JAX-RS
+     * request, for entry points this filter never sees (for example MCP tool calls on {@code /mcp}).
+     *
+     * <p>Follows the same steps as a normal request: credential lookup, realm-access validation,
+     * role resolution, realm override and custom properties. Impersonation headers are not applied.</p>
+     *
+     * @param realmOverride optional target realm, validated exactly like the {@code X-Realm} header
+     * @return the principal context for the caller (an anonymous context when unauthenticated), never null
+     * @throws IllegalArgumentException when the caller may not access {@code realmOverride}
+     */
+    public PrincipalContext buildPrincipalContextForCurrentIdentity(String realmOverride) {
+        String realm = (realmOverride == null || realmOverride.isBlank()) ? null : realmOverride;
+        if (securityIdentity == null || securityIdentity.isAnonymous()) {
+            // Same as a request without credentials: an anonymous context, which policy rules then judge.
+            return buildAnonymousContext(realm);
+        }
+
+        String sub = null;
+        try {
+            sub = jwt != null ? jwt.getClaim("sub") : null;
+        } catch (RuntimeException e) {
+            Log.debugf("No JWT available for the current identity: %s", e.getMessage());
+        }
+
+        ContextBuildResult result = sub != null
+            ? buildJwtContextWithCredentials(AUTHENTICATION_SCHEME + " ", realm)
+            : buildIdentityContextWithCredentials(realm);
+        PrincipalContext context = applyRealmOverride(result.context, realm);
+        return applyCustomProperties(null, context, result.credentials);
+    }
+
+    /**
+     * Evaluates the policy rules for a principal and resource, with deny as the default.
+     *
+     * @return true only when the final effect is ALLOW
+     */
+    public boolean isAllowed(PrincipalContext principalContext, ResourceContext resourceContext) {
+        com.e2eq.framework.model.securityrules.SecurityCheckResponse response =
+            ruleContext.checkRules(principalContext, resourceContext, com.e2eq.framework.model.securityrules.RuleEffect.DENY);
+        return response.getFinalEffect() == com.e2eq.framework.model.securityrules.RuleEffect.ALLOW;
+    }
+
     private ContextBuildResult buildJwtContextWithCredentials(String authHeader, String realmOverride) {
         // Extract token (variable kept for potential future use)
         @SuppressWarnings("unused")

@@ -18,7 +18,9 @@ import com.e2eq.framework.model.persistent.imports.ImportSessionRow;
 import com.e2eq.framework.model.securityrules.PrincipalContext;
 import com.e2eq.framework.model.securityrules.ResourceContext;
 import com.e2eq.framework.model.securityrules.SecurityContext;
+import com.e2eq.framework.rest.filters.SecurityFilter;
 import com.e2eq.framework.rest.models.Collection;
+import com.e2eq.framework.model.persistent.base.SortField;
 import com.e2eq.framework.csv.CSVExportHelper;
 import com.e2eq.framework.csv.CSVImportHelper;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -124,10 +126,10 @@ public class QueryGatewayResource {
     ObjectMapper objectMapper;
 
     @Inject
-    Instance<BaseMorphiaRepo<? extends UnversionedBaseModel>> allRepos;
+    CSVImportHelper csvImportHelper;
 
     @Inject
-    CSVImportHelper csvImportHelper;
+    SecurityFilter securityFilter;
 
     @Inject
     ImportSessionRowRepo importSessionRowRepo;
@@ -148,6 +150,7 @@ public class QueryGatewayResource {
     @FunctionalAction("plan")
     public PlanResponse plan(PlanRequest req) {
         Class<? extends UnversionedBaseModel> root = resolveRoot(req.rootType);
+        requireEntityPermission(root, ACTION_LIST, null);
         PlannerResult pr = gateway.plan(req.query, root);
         PlanResponse out = new PlanResponse();
         out.mode = pr.getMode().name();
@@ -164,7 +167,9 @@ public class QueryGatewayResource {
     @GET
     @Path("/rootTypes")
     @FunctionalAction("listRootTypes")
+    @SuppressWarnings("unchecked")
     public RootTypesResponse listRootTypes() {
+        PrincipalContext principal = effectivePrincipal(null);
         MorphiaDatastore ds = morphiaDataStoreWrapper.getDataStore(defaultRealm);
         Mapper mapper = ds.getMapper();
 
@@ -172,7 +177,8 @@ public class QueryGatewayResource {
         for (EntityModel em : mapper.getMappedEntities()) {
             Class<?> type = em.getType();
             // Only include classes that extend UnversionedBaseModel
-            if (UnversionedBaseModel.class.isAssignableFrom(type)) {
+            if (UnversionedBaseModel.class.isAssignableFrom(type)
+                    && mayList((Class<? extends UnversionedBaseModel>) type, principal)) {
                 RootTypeInfo info = new RootTypeInfo();
                 info.className = type.getName();
                 info.simpleName = type.getSimpleName();
@@ -233,7 +239,10 @@ public class QueryGatewayResource {
                 body.put("message", "Aggregation pipeline contains an unresolved $lookup.from. MetadataRegistry must resolve target collections.");
                 return Response.status(422).entity(body).build();
             }
-            // Execute aggregation pipeline against the root collection
+            // Execute aggregation pipeline against the root collection.
+            // The pipeline reads collections directly, so repo row filters are NOT applied here;
+            // keep feature.queryGateway.execution.enabled off for callers with row-level scoping.
+            requireEntityPermission(root, ACTION_LIST, req.realm);
             String realm = resolveRealm(req.realm);
             Datastore ds = morphiaDataStoreWrapper.getDataStore(realm);
             String rootCollection = resolveCollectionName(root);
@@ -259,19 +268,27 @@ public class QueryGatewayResource {
             Collection<org.bson.Document> col = new Collection<>(rows, effSkip, effLimit, req.query);
             return Response.ok(col).build();
         }
-        // FILTER path using Morphia
-        String realm = resolveRealm(req.realm);
-        Datastore ds = morphiaDataStoreWrapper.getDataStore(realm);
-        Query<? extends UnversionedBaseModel> q = ds.find(root);
-        if (planned.getFilter() != null) {
-            q = q.filter(planned.getFilter());
-        }
+        // FILTER path: read through the entity's repo so realm scoping and row-level
+        // security filters are the same ones the entity's own list endpoint applies.
         int fLimit = req.page != null && req.page.limit != null ? req.page.limit : 50;
         int fSkip = req.page != null && req.page.skip != null ? req.page.skip : 0;
-        FindOptions fo = new FindOptions().limit(fLimit).skip(fSkip);
-        List<?> rows = q.iterator(fo).toList();
-        Collection<?> col = new Collection<>(rows, fSkip, fLimit, req.query);
-        return Response.ok(col).build();
+        List<SortField> repoSort = null;
+        if (req.sort != null && !req.sort.isEmpty()) {
+            repoSort = new ArrayList<>();
+            for (SortSpec spec : req.sort) {
+                if (spec == null || spec.field == null || spec.field.isBlank()) continue;
+                boolean desc = spec.dir != null && spec.dir.equalsIgnoreCase("DESC");
+                repoSort.add(new SortField(spec.field, desc ? SortField.SortDirection.DESC : SortField.SortDirection.ASC));
+            }
+        }
+        final List<SortField> fSort = repoSort;
+        return withEntityAccess(root, ACTION_LIST, req.realm, realm -> {
+            @SuppressWarnings("unchecked")
+            BaseMorphiaRepo<UnversionedBaseModel> repo = resolveRepo((Class<UnversionedBaseModel>) root);
+            List<?> rows = repo.getListByQuery(realm, fSkip, fLimit, req.query, fSort, null);
+            Collection<?> col = new Collection<>(rows, fSkip, fLimit, req.query);
+            return Response.ok(col).build();
+        });
     }
 
     // ========================================================================
@@ -283,12 +300,9 @@ public class QueryGatewayResource {
     @FunctionalAction("count")
     public Response count(CountRequest req) {
         Class<? extends UnversionedBaseModel> root = resolveRoot(req.rootType);
-        String realm = resolveRealm(req.realm);
-        Datastore ds = morphiaDataStoreWrapper.getDataStore(realm);
+        requireEntityPermission(root, ACTION_LIST, req.realm);
 
         try {
-            Query<? extends UnversionedBaseModel> q = ds.find(root);
-
             if (req.query != null && !req.query.isBlank()) {
                 Map<String, String> variableMap = variableMapForQuery(req.realm);
                 PlannedQuery planned = MorphiaUtils.convertToPlannedQuery(req.query, root, null, null, null, variableMap);
@@ -298,18 +312,22 @@ public class QueryGatewayResource {
                     error.put("message", "Count queries cannot use expand() - only simple filter queries are supported");
                     return Response.status(Response.Status.BAD_REQUEST).entity(error).build();
                 }
-                if (planned.getFilter() != null) {
-                    q = q.filter(planned.getFilter());
-                }
             }
 
-            long count = q.count();
+            // Count through the entity's repo so realm scoping and row-level security filters apply.
+            long count = withEntityAccess(root, ACTION_LIST, req.realm, realm -> {
+                @SuppressWarnings("unchecked")
+                BaseMorphiaRepo<UnversionedBaseModel> repo = resolveRepo((Class<UnversionedBaseModel>) root);
+                return repo.getCount(realm, req.query);
+            });
 
             CountResponse response = new CountResponse();
             response.count = count;
             response.rootType = root.getName();
             response.query = req.query;
             return Response.ok(response).build();
+        } catch (WebApplicationException e) {
+            throw e;
         } catch (Exception e) {
             Log.errorf(e, "Failed to count entities of type %s", root.getName());
             Map<String, Object> error = new HashMap<>();
@@ -355,6 +373,7 @@ public class QueryGatewayResource {
         }
 
         Class<? extends UnversionedBaseModel> root = resolveRoot(req.rootType);
+        requireEntityPermission(root, hasId(req.entity) ? ACTION_UPDATE : ACTION_CREATE, req.realm);
         String realm = resolveRealm(req.realm);
         Datastore ds = morphiaDataStoreWrapper.getDataStore(realm);
 
@@ -415,6 +434,7 @@ public class QueryGatewayResource {
         }
 
         Class<? extends UnversionedBaseModel> root = resolveRoot(req.rootType);
+        requireEntityPermission(root, ACTION_DELETE, req.realm);
         String realm = resolveRealm(req.realm);
         Datastore ds = morphiaDataStoreWrapper.getDataStore(realm);
 
@@ -485,6 +505,7 @@ public class QueryGatewayResource {
     @FunctionalAction("deleteMany")
     public Response deleteMany(DeleteManyRequest req) {
         Class<? extends UnversionedBaseModel> root = resolveRoot(req.rootType);
+        requireEntityPermission(root, ACTION_DELETE, req.realm);
         String realm = resolveRealm(req.realm);
         Datastore ds = morphiaDataStoreWrapper.getDataStore(realm);
 
@@ -560,18 +581,49 @@ public class QueryGatewayResource {
     // IMPORT / EXPORT ENDPOINTS
     // ========================================================================
 
+    private volatile Map<String, BaseMorphiaRepo<? extends UnversionedBaseModel>> reposByModel;
+
     /**
-     * Resolves a BaseMorphiaRepo for the given entity class by iterating all CDI-managed repos.
+     * Repositories keyed by model class name. Built from every repository bean in the container:
+     * typed lookup through {@code Instance<BaseMorphiaRepo<? extends UnversionedBaseModel>>} only
+     * resolves a few of them, and reads now depend on finding the repo for any root type.
      */
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private Map<String, BaseMorphiaRepo<? extends UnversionedBaseModel>> reposByModel() {
+        Map<String, BaseMorphiaRepo<? extends UnversionedBaseModel>> map = reposByModel;
+        if (map == null) {
+            map = new HashMap<>();
+            jakarta.enterprise.inject.spi.BeanManager beanManager = io.quarkus.arc.Arc.container().beanManager();
+            for (jakarta.enterprise.inject.spi.Bean<?> bean : beanManager
+                    .getBeans(Object.class, jakarta.enterprise.inject.Any.Literal.INSTANCE)) {
+                if (bean.getBeanClass() == null || !BaseMorphiaRepo.class.isAssignableFrom(bean.getBeanClass())) {
+                    continue;
+                }
+                try {
+                    BaseMorphiaRepo repo = (BaseMorphiaRepo) beanManager.getReference(
+                            bean, Object.class, beanManager.createCreationalContext((jakarta.enterprise.inject.spi.Bean) bean));
+                    Class<?> model = repo != null ? repo.getPersistentClass() : null;
+                    if (model != null) {
+                        map.putIfAbsent(model.getName(), repo);
+                    }
+                } catch (RuntimeException e) {
+                    Log.debugf("Skipping repository bean %s: %s", bean.getBeanClass().getName(), e.getMessage());
+                }
+            }
+            reposByModel = map;
+        }
+        return map;
+    }
+
+    /** Resolves the repository for the given entity class. */
     @SuppressWarnings("unchecked")
     private <T extends UnversionedBaseModel> BaseMorphiaRepo<T> resolveRepo(Class<T> rootClass) {
-        for (BaseMorphiaRepo<? extends UnversionedBaseModel> repo : allRepos) {
-            if (repo.getPersistentClass() != null && repo.getPersistentClass().equals(rootClass)) {
-                return (BaseMorphiaRepo<T>) repo;
-            }
+        BaseMorphiaRepo<? extends UnversionedBaseModel> repo = reposByModel().get(rootClass.getName());
+        if (repo != null) {
+            return (BaseMorphiaRepo<T>) repo;
         }
         throw new BadRequestException("No repository found for type: " + rootClass.getName()
-                + ". Import/export requires a registered MorphiaRepo for this entity type.");
+                + ". The query gateway requires a registered MorphiaRepo for this entity type.");
     }
 
     /**
@@ -598,6 +650,7 @@ public class QueryGatewayResource {
         }
 
         Class<? extends UnversionedBaseModel> root = resolveRoot(req.rootType);
+        requireEntityPermission(root, ACTION_CREATE, req.realm);
         @SuppressWarnings("unchecked")
         BaseMorphiaRepo<UnversionedBaseModel> repo = resolveRepo((Class<UnversionedBaseModel>) root);
 
@@ -737,6 +790,7 @@ public class QueryGatewayResource {
         }
 
         Class<? extends UnversionedBaseModel> root = resolveRoot(req.rootType);
+        requireEntityPermission(root, ACTION_CREATE, req.realm);
         @SuppressWarnings("unchecked")
         BaseMorphiaRepo<UnversionedBaseModel> repo = resolveRepo((Class<UnversionedBaseModel>) root);
 
@@ -796,6 +850,10 @@ public class QueryGatewayResource {
     @FunctionalAction("export")
     public Response export(ExportRequest req) {
         Class<? extends UnversionedBaseModel> root = resolveRoot(req.rootType);
+        return withEntityAccess(root, ACTION_LIST, req.realm, realm -> exportSecured(req, root, realm));
+    }
+
+    private Response exportSecured(ExportRequest req, Class<? extends UnversionedBaseModel> root, String realm) {
         @SuppressWarnings("unchecked")
         BaseMorphiaRepo<UnversionedBaseModel> repo = resolveRepo((Class<UnversionedBaseModel>) root);
 
@@ -814,18 +872,8 @@ public class QueryGatewayResource {
                     quoteChar, charset, false, query, skip, limit,
                     includeHeader, null);
 
-            // Determine row count for threshold decision
-            String realm = resolveRealm(req.realm);
-            Datastore ds = morphiaDataStoreWrapper.getDataStore(realm);
-            Query<? extends UnversionedBaseModel> countQuery = ds.find(root);
-            if (query != null && !query.isBlank()) {
-                Map<String, String> variableMap = variableMapForQuery(req.realm);
-                PlannedQuery planned = MorphiaUtils.convertToPlannedQuery(query, root, null, null, null, variableMap);
-                if (planned.getFilter() != null) {
-                    countQuery = countQuery.filter(planned.getFilter());
-                }
-            }
-            long rowCount = countQuery.count();
+            // Row count for the threshold decision, through the repo so row-level filters apply
+            long rowCount = repo.getCount(realm, (query != null && !query.isBlank()) ? query : null);
 
             ExportResponse response = new ExportResponse();
             response.rootType = root.getName();
@@ -848,7 +896,7 @@ public class QueryGatewayResource {
             }
 
             return Response.ok(response).build();
-        } catch (BadRequestException e) {
+        } catch (WebApplicationException e) {
             throw e;
         } catch (Exception e) {
             Log.errorf(e, "Failed to export entities of type %s", req.rootType);
@@ -906,9 +954,113 @@ public class QueryGatewayResource {
         return minimal;
     }
 
+    private static final String ACTION_LIST = "LIST";
+    private static final String ACTION_CREATE = "create";
+    private static final String ACTION_UPDATE = "update";
+    private static final String ACTION_DELETE = "delete";
+
+    /**
+     * The principal a gateway operation runs as. Uses the context the SecurityFilter set for REST
+     * calls and builds one from the current identity otherwise. An explicit request realm that
+     * differs from the principal's realm is validated and applied like the X-Realm header.
+     *
+     * @throws ForbiddenException when the caller may not access {@code requestRealm}
+     */
+    private PrincipalContext effectivePrincipal(String requestRealm) {
+        PrincipalContext base = SecurityContext.getPrincipalContext()
+                .orElseGet(() -> securityFilter.buildPrincipalContextForCurrentIdentity(null));
+        if (requestRealm == null || requestRealm.isBlank() || requestRealm.equals(base.getDefaultRealm())) {
+            return base;
+        }
+        if (base.getImpersonatedBySubject() != null || base.getImpersonatedByUserId() != null) {
+            throw new ForbiddenException("A realm cannot be supplied while impersonating another user");
+        }
+        try {
+            return securityFilter.buildPrincipalContextForCurrentIdentity(requestRealm);
+        } catch (IllegalArgumentException e) {
+            throw new ForbiddenException(e.getMessage());
+        }
+    }
+
+    /** The entity's own functional area/domain with the given action, as its REST resource would use. */
+    private ResourceContext entityResource(Class<? extends UnversionedBaseModel> root, String action) {
+        String area = null;
+        String domain = null;
+        FunctionalMapping mapping = root.getAnnotation(FunctionalMapping.class);
+        if (mapping != null) {
+            area = mapping.area();
+            domain = mapping.domain();
+        } else {
+            try {
+                UnversionedBaseModel instance = root.getDeclaredConstructor().newInstance();
+                area = instance.bmFunctionalArea();
+                domain = instance.bmFunctionalDomain();
+            } catch (ReflectiveOperationException | RuntimeException e) {
+                Log.debugf("No functional mapping for %s: %s", root.getName(), e.getMessage());
+            }
+        }
+        if (area == null || area.isBlank() || domain == null || domain.isBlank()) {
+            throw new ForbiddenException("Type is not available through the query gateway: " + root.getSimpleName());
+        }
+        return new ResourceContext.Builder()
+                .withArea(area)
+                .withFunctionalDomain(domain)
+                .withAction(action)
+                .build();
+    }
+
+    private boolean mayList(Class<? extends UnversionedBaseModel> root, PrincipalContext principal) {
+        try {
+            return securityFilter.isAllowed(principal, entityResource(root, ACTION_LIST));
+        } catch (RuntimeException e) {
+            return false;
+        }
+    }
+
+    private static boolean hasId(Map<String, Object> entity) {
+        return entity != null && (entity.get("_id") != null || entity.get("id") != null);
+    }
+
+    /**
+     * Checks that the caller holds the entity's own permission for the action (not just the
+     * gateway's integration/query permission) and may use the requested realm.
+     *
+     * @return the principal the operation should run as
+     */
+    private PrincipalContext requireEntityPermission(Class<? extends UnversionedBaseModel> root, String action, String requestRealm) {
+        PrincipalContext principal = effectivePrincipal(requestRealm);
+        ResourceContext resource = entityResource(root, action);
+        if (!securityFilter.isAllowed(principal, resource)) {
+            throw new ForbiddenException(String.format("Access denied: user=%s, area=%s, domain=%s, action=%s",
+                    principal.getUserId(), resource.getArea(), resource.getFunctionalDomain(), resource.getAction()));
+        }
+        return principal;
+    }
+
+    /**
+     * Runs {@code work} as the entity's own resource context so repository calls apply the same
+     * realm scoping and row-level security filters as the entity's list endpoint.
+     */
+    private <T> T withEntityAccess(Class<? extends UnversionedBaseModel> root, String action, String requestRealm,
+                                   java.util.function.Function<String, T> work) {
+        PrincipalContext principal = requireEntityPermission(root, action, requestRealm);
+        ResourceContext resource = entityResource(root, action);
+        String realm = resolveRealm(requestRealm);
+        SecurityContext.pushPrincipalContext(principal);
+        SecurityContext.pushResourceContext(resource);
+        try {
+            return work.apply(realm);
+        } finally {
+            SecurityContext.popResourceContext();
+            SecurityContext.popPrincipalContext();
+        }
+    }
+
     private String resolveRealm(String requestRealm) {
-        // 1. Explicit realm from request takes highest priority
+        // 1. Explicit realm from request takes highest priority, but only after the same
+        //    realm-access validation the X-Realm header gets.
         if (requestRealm != null && !requestRealm.isBlank()) {
+            effectivePrincipal(requestRealm);
             return requestRealm;
         }
 
