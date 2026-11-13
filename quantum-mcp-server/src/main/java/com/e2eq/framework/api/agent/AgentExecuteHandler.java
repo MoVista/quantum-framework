@@ -1,9 +1,14 @@
 package com.e2eq.framework.api.agent;
 
 import com.e2eq.framework.api.query.QueryGatewayResource;
+import com.e2eq.framework.model.securityrules.PrincipalContext;
+import com.e2eq.framework.model.securityrules.ResourceContext;
+import com.e2eq.framework.model.securityrules.SecurityContext;
+import com.e2eq.framework.rest.filters.SecurityFilter;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
+import jakarta.ws.rs.WebApplicationException;
 import jakarta.ws.rs.core.Response;
 
 import java.util.Map;
@@ -25,6 +30,24 @@ public class AgentExecuteHandler {
     @Inject
     ObjectMapper objectMapper;
 
+    @Inject
+    SecurityFilter securityFilter;
+
+    /** Tool name to the gateway action the REST endpoint for that tool is authorized under. */
+    private static final Map<String, String> TOOL_ACTIONS = Map.ofEntries(
+            Map.entry("query_rootTypes", "listRootTypes"),
+            Map.entry("query_plan", "plan"),
+            Map.entry("query_find", "find"),
+            Map.entry("query_count", "count"),
+            Map.entry("query_save", "save"),
+            Map.entry("query_delete", "delete"),
+            Map.entry("query_deleteMany", "deleteMany"),
+            Map.entry("query_import_analyze", "importAnalyze"),
+            Map.entry("query_import_rows", "importRows"),
+            Map.entry("query_import_commit", "importCommit"),
+            Map.entry("query_import_cancel", "importCancel"),
+            Map.entry("query_export", "export"));
+
     /**
      * Executes a gateway tool by name.
      *
@@ -40,6 +63,59 @@ public class AgentExecuteHandler {
         }
         arguments = arguments != null ? arguments : Map.of();
 
+        // Callers reach this without the gateway's own REST pre-authorization: MCP tool calls never
+        // pass through the SecurityFilter, and /api/agent/execute is @Authenticated, which skips it.
+        // Establish the caller's security context if needed and apply the same check here.
+        boolean establishedContext = false;
+        boolean pushedResource = false;
+        try {
+            if (SecurityContext.getPrincipalContext().isEmpty()) {
+                // No principal means the SecurityFilter did not run for this call, so any request
+                // still recorded on this thread belongs to an earlier one.
+                SecurityFilter.clearCurrentRequest();
+                SecurityContext.setPrincipalContext(securityFilter.buildPrincipalContextForCurrentIdentity(null));
+                establishedContext = true;
+            }
+            String action = TOOL_ACTIONS.get(tool);
+            if (action != null) {
+                PrincipalContext principal = SecurityContext.getPrincipalContext().orElseThrow();
+                ResourceContext gatewayResource = new ResourceContext.Builder()
+                        .withArea("integration")
+                        .withFunctionalDomain("query")
+                        .withAction(action)
+                        .build();
+                if (!securityFilter.isAllowed(principal, gatewayResource)) {
+                    return Response.status(Response.Status.FORBIDDEN)
+                            .entity(Map.of("error", "AccessDenied", "message", String.format(
+                                    "Access denied: user=%s, area=integration, domain=query, action=%s",
+                                    principal.getUserId(), action)))
+                            .build();
+                }
+                // Run the tool as the gateway resource, as the REST endpoint does, so repository
+                // calls it makes directly (import sessions) get that resource's rule filters.
+                SecurityContext.pushResourceContext(gatewayResource);
+                pushedResource = true;
+            }
+            return dispatch(tool, arguments);
+        } catch (WebApplicationException e) {
+            int status = e.getResponse() != null ? e.getResponse().getStatus() : 500;
+            return Response.status(status)
+                    .entity(Map.of("error", status == 403 ? "AccessDenied" : "RequestFailed",
+                            "message", String.valueOf(e.getMessage())))
+                    .build();
+        } finally {
+            if (pushedResource) {
+                SecurityContext.popResourceContext();
+            }
+            if (establishedContext) {
+                // No response filter runs for MCP calls, so clear what the REST filter would clear.
+                SecurityContext.clear();
+                com.e2eq.framework.security.runtime.RuleContext.clearRequestCache();
+            }
+        }
+    }
+
+    private Response dispatch(String tool, Map<String, Object> arguments) {
         return switch (tool) {
             case "query_rootTypes" -> {
                 QueryGatewayResource.RootTypesResponse r = queryGatewayResource.listRootTypes();
