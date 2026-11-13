@@ -661,6 +661,11 @@ public class SecurityFilter implements ContainerRequestFilter, jakarta.ws.rs.con
      * <p>Follows the same steps as a normal request: credential lookup, realm-access validation,
      * role resolution, realm override and custom properties. Impersonation headers are not applied.</p>
      *
+     * <p>There is no HTTP request here, so a {@code PrincipalContextPropertiesResolver} receives a
+     * {@code ResolutionContext} with a null request context. A resolver that needs the request
+     * fails, is logged and skipped, and its properties are absent from the returned context; rules
+     * that reference such a property then have no value to resolve.</p>
+     *
      * @param realmOverride optional target realm, validated exactly like the {@code X-Realm} header
      * @return the principal context for the caller (an anonymous context when unauthenticated), never null
      * @throws IllegalArgumentException when the caller may not access {@code realmOverride}
@@ -687,11 +692,16 @@ public class SecurityFilter implements ContainerRequestFilter, jakarta.ws.rs.con
     }
 
     /**
-     * Evaluates the policy rules for a principal and resource, with deny as the default.
+     * Evaluates the policy rules for a principal and resource, with deny as the default. This is the
+     * same pre-authorization the request filter runs, and it follows the same switch: when
+     * {@code quantum.security.filter.enforcePreAuth} is false, nothing is pre-authorized here either.
      *
-     * @return true only when the final effect is ALLOW
+     * @return true when the final effect is ALLOW, or when pre-authorization is disabled
      */
     public boolean isAllowed(PrincipalContext principalContext, ResourceContext resourceContext) {
+        if (!enforcePreAuth) {
+            return true;
+        }
         com.e2eq.framework.model.securityrules.SecurityCheckResponse response =
             ruleContext.checkRules(principalContext, resourceContext, com.e2eq.framework.model.securityrules.RuleEffect.DENY);
         return response.getFinalEffect() == com.e2eq.framework.model.securityrules.RuleEffect.ALLOW;

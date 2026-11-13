@@ -67,6 +67,7 @@ public class AgentExecuteHandler {
         // pass through the SecurityFilter, and /api/agent/execute is @Authenticated, which skips it.
         // Establish the caller's security context if needed and apply the same check here.
         boolean establishedContext = false;
+        boolean pushedResource = false;
         try {
             if (SecurityContext.getPrincipalContext().isEmpty()) {
                 SecurityContext.setPrincipalContext(securityFilter.buildPrincipalContextForCurrentIdentity(null));
@@ -87,6 +88,10 @@ public class AgentExecuteHandler {
                                     principal.getUserId(), action)))
                             .build();
                 }
+                // Run the tool as the gateway resource, as the REST endpoint does, so repository
+                // calls it makes directly (import sessions) get that resource's rule filters.
+                SecurityContext.pushResourceContext(gatewayResource);
+                pushedResource = true;
             }
             return dispatch(tool, arguments);
         } catch (WebApplicationException e) {
@@ -96,8 +101,13 @@ public class AgentExecuteHandler {
                             "message", String.valueOf(e.getMessage())))
                     .build();
         } finally {
+            if (pushedResource) {
+                SecurityContext.popResourceContext();
+            }
             if (establishedContext) {
+                // No response filter runs for MCP calls, so clear what the REST filter would clear.
                 SecurityContext.clear();
+                com.e2eq.framework.security.runtime.RuleContext.clearRequestCache();
             }
         }
     }
