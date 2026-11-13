@@ -413,7 +413,11 @@ public class QueryGatewayResource {
 
         Class<? extends UnversionedBaseModel> root = resolveRoot(req.rootType);
         boolean claimsUpdate = hasId(req.entity);
-        Access access = authorize(root, req.realm, claimsUpdate ? ACTION_UPDATE : ACTION_CREATE);
+        // With an id the save may turn out to be an update or an insert; either permission lets
+        // the request in, and the exact one is required below once that is known.
+        Access access = claimsUpdate
+                ? authorize(root, req.realm, ACTION_UPDATE, ACTION_CREATE)
+                : authorize(root, req.realm, ACTION_CREATE);
         String realm = access.realm;
         Datastore ds = morphiaDataStoreWrapper.getDataStore(realm);
 
@@ -422,10 +426,11 @@ public class QueryGatewayResource {
             UnversionedBaseModel entity = objectMapper.convertValue(req.entity, root);
 
             // save() inserts when the id does not exist yet, so an id alone does not make this an
-            // update: creating a record needs the create permission.
-            if (claimsUpdate && (entity.getId() == null
-                    || ds.find(root).filter(Filters.eq("_id", entity.getId())).count() == 0)) {
-                ensureAllowed(access.principal, root, ACTION_CREATE);
+            // update: require update for an existing record and create for a new one.
+            if (claimsUpdate) {
+                boolean exists = entity.getId() != null
+                        && ds.find(root).filter(Filters.eq("_id", entity.getId())).count() > 0;
+                ensureAllowed(access.principal, root, exists ? ACTION_UPDATE : ACTION_CREATE);
             }
 
             // Save (insert or update)
@@ -553,7 +558,8 @@ public class QueryGatewayResource {
     @FunctionalAction("deleteMany")
     public Response deleteMany(DeleteManyRequest req) {
         Class<? extends UnversionedBaseModel> root = resolveRoot(req.rootType);
-        String realm = authorize(root, req.realm, ACTION_DELETE).realm;
+        Access access = authorize(root, req.realm, ACTION_DELETE);
+        String realm = access.realm;
         Datastore ds = morphiaDataStoreWrapper.getDataStore(realm);
 
         try {
@@ -561,7 +567,9 @@ public class QueryGatewayResource {
 
             // Apply query filter if provided
             if (req.query != null && !req.query.isBlank()) {
-                Map<String, String> variableMap = variableMapForQuery(req.realm);
+                // Variables come from the principal that was authorized for the target realm, not
+                // from the thread context, which may still be the caller's home realm.
+                Map<String, String> variableMap = MorphiaUtils.createStandardVariableMapFrom(access.principal, access.resource);
                 PlannedQuery planned = MorphiaUtils.convertToPlannedQuery(req.query, root, null, null, null, variableMap);
                 if (planned.getMode() == PlannerResult.Mode.AGGREGATION) {
                     Map<String, Object> error = new HashMap<>();
@@ -1259,12 +1267,13 @@ public class QueryGatewayResource {
         }
         String targetType = session.getTargetType();
         if (targetType != null && !targetType.isBlank()) {
-            // Resolve by simple name: Class.forName cannot see application classes in every runtime.
-            Class<? extends UnversionedBaseModel> root = resolveRoot(targetType.substring(targetType.lastIndexOf('.') + 1));
-            if (!root.getName().equals(targetType)) {
+            // Look the full name up in the repository map: it keeps types that share a simple name
+            // apart, and Class.forName cannot see application classes in every runtime.
+            BaseMorphiaRepo<? extends UnversionedBaseModel> repo = reposByModel().get(targetType);
+            if (repo == null || repo.getPersistentClass() == null) {
                 throw new NotFoundException("Unknown import session: " + sessionId);
             }
-            firstAllowed(principal, root, ACTION_CREATE, ACTION_UPDATE);
+            firstAllowed(principal, repo.getPersistentClass(), ACTION_CREATE, ACTION_UPDATE);
         }
         return session;
     }

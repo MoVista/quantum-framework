@@ -70,6 +70,9 @@ public class AgentExecuteHandler {
         boolean pushedResource = false;
         try {
             if (SecurityContext.getPrincipalContext().isEmpty()) {
+                // No principal means the SecurityFilter did not run for this call, so any request
+                // still recorded on this thread belongs to an earlier one.
+                SecurityFilter.clearCurrentRequest();
                 SecurityContext.setPrincipalContext(securityFilter.buildPrincipalContextForCurrentIdentity(null));
                 establishedContext = true;
             }

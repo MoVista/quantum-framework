@@ -110,11 +110,21 @@ public class SecurityFilter implements ContainerRequestFilter, jakarta.ws.rs.con
     @Inject
     jakarta.enterprise.inject.Instance<com.e2eq.framework.model.securityrules.PrincipalContextPropertiesResolver> propertyResolvers;
 
+    /** The request this thread is serving, when it came through this filter. */
+    private static final ThreadLocal<ContainerRequestContext> CURRENT_REQUEST = new ThreadLocal<>();
+
+    /** Forgets any request left on this thread; for entry points that never pass through this filter. */
+    public static void clearCurrentRequest() {
+        CURRENT_REQUEST.remove();
+    }
+
     private static final java.util.concurrent.atomic.AtomicBoolean WARNED_PERMISSIVE = new java.util.concurrent.atomic.AtomicBoolean(false);
 
 
     @Override
     public void filter(ContainerRequestContext requestContext) throws IOException {
+        // Kept for principal rebuilds later in this request (see buildPrincipalContextForCurrentIdentity)
+        CURRENT_REQUEST.set(requestContext);
         // HERE FOR DOCUMENTATION ONLY
         // the context may be set in an upstream filter specifically in the PermissionPreFilter based upon
         // an annotation.  In this case determineResourceContext() as well determinePrincipalContext() should
@@ -195,6 +205,7 @@ public class SecurityFilter implements ContainerRequestFilter, jakarta.ws.rs.con
         public void filter(ContainerRequestContext requestContext, jakarta.ws.rs.container.ContainerResponseContext responseContext) throws IOException {
             // Clear ThreadLocal contexts after a response is produced
             SecurityContext.clear();
+            CURRENT_REQUEST.remove();
             // Clear per-request permission cache
             try {
                 com.e2eq.framework.security.runtime.RuleContext.clearRequestCache();
@@ -562,7 +573,7 @@ public class SecurityFilter implements ContainerRequestFilter, jakarta.ws.rs.con
         PrincipalContext contextWithRealm = applyRealmOverride(contextWithImpersonation, realm);
 
         // Apply custom property resolvers
-        return applyCustomProperties(requestContext, contextWithRealm, credentials);
+        return applyCustomProperties(requestContext, contextWithRealm, credentials, false);
     }
 
     /**
@@ -661,14 +672,17 @@ public class SecurityFilter implements ContainerRequestFilter, jakarta.ws.rs.con
      * <p>Follows the same steps as a normal request: credential lookup, realm-access validation,
      * role resolution, realm override and custom properties. Impersonation headers are not applied.</p>
      *
-     * <p>There is no HTTP request here, so a {@code PrincipalContextPropertiesResolver} receives a
-     * {@code ResolutionContext} with a null request context. A resolver that needs the request
-     * fails, is logged and skipped, and its properties are absent from the returned context; rules
-     * that reference such a property then have no value to resolve.</p>
+     * <p>When the thread is serving a request that came through this filter (a REST call that
+     * rebuilds its principal for another realm), {@code PrincipalContextPropertiesResolver}s get
+     * that request. Otherwise there is no HTTP request and they receive a null request context;
+     * if a resolver then fails, this method refuses the call. A rule filter that references a
+     * missing property is skipped by the rule engine, so continuing without the property could
+     * return rows outside the caller's scope.</p>
      *
      * @param realmOverride optional target realm, validated exactly like the {@code X-Realm} header
      * @return the principal context for the caller (an anonymous context when unauthenticated), never null
      * @throws IllegalArgumentException when the caller may not access {@code realmOverride}
+     * @throws jakarta.ws.rs.ForbiddenException when a property resolver fails without a request
      */
     public PrincipalContext buildPrincipalContextForCurrentIdentity(String realmOverride) {
         String realm = (realmOverride == null || realmOverride.isBlank()) ? null : realmOverride;
@@ -688,7 +702,8 @@ public class SecurityFilter implements ContainerRequestFilter, jakarta.ws.rs.con
             ? buildJwtContextWithCredentials(AUTHENTICATION_SCHEME + " ", realm)
             : buildIdentityContextWithCredentials(realm);
         PrincipalContext context = applyRealmOverride(result.context, realm);
-        return applyCustomProperties(null, context, result.credentials);
+        ContainerRequestContext request = CURRENT_REQUEST.get();
+        return applyCustomProperties(request, context, result.credentials, request == null);
     }
 
     /**
@@ -769,7 +784,8 @@ public class SecurityFilter implements ContainerRequestFilter, jakarta.ws.rs.con
     private PrincipalContext applyCustomProperties(
             ContainerRequestContext requestContext,
             PrincipalContext context,
-            CredentialUserIdPassword credentials) {
+            CredentialUserIdPassword credentials,
+            boolean failClosed) {
 
         if (propertyResolvers == null || propertyResolvers.isUnsatisfied()) {
             return context;
@@ -808,6 +824,12 @@ public class SecurityFilter implements ContainerRequestFilter, jakarta.ws.rs.con
                     }
                 }
             } catch (Exception e) {
+                if (failClosed) {
+                    Log.warnf(e, "PrincipalContextPropertiesResolver %s failed without an HTTP request; refusing the call",
+                        resolver.getClass().getName());
+                    throw new jakarta.ws.rs.ForbiddenException(
+                        "Security properties could not be resolved for this call");
+                }
                 Log.warnf(e, "PrincipalContextPropertiesResolver %s failed; skipping",
                     resolver.getClass().getName());
             }
