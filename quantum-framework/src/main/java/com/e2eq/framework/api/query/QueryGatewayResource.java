@@ -824,17 +824,22 @@ public class QueryGatewayResource {
             int skip = (req.skip != null) ? req.skip : 0;
             int limit = (req.limit != null) ? req.limit : 50;
 
-            // Build filter query for ImportSessionRow
-            StringBuilder filter = new StringBuilder("sessionRefName:" + req.sessionId);
+            // Typed filters, not a query string: caller-supplied values must not be able to add
+            // clauses that widen the match beyond the caller's own session.
+            List<Filter> filters = new ArrayList<>();
+            filters.add(Filters.eq("sessionRefName", req.sessionId));
             if (req.onlyErrors != null && req.onlyErrors) {
-                filter.append(" && hasErrors:true");
+                filters.add(Filters.eq("hasErrors", true));
             }
             if (req.intent != null && !req.intent.isBlank()) {
-                filter.append(" && intent:").append(req.intent);
+                String intent = req.intent.trim();
+                if (!IMPORT_ROW_INTENTS.contains(intent)) {
+                    throw new BadRequestException("intent must be one of " + IMPORT_ROW_INTENTS);
+                }
+                filters.add(Filters.eq("intent", intent));
             }
 
-            List<ImportSessionRow> rows = importSessionRowRepo.getListByQuery(
-                    realm, skip, limit, filter.toString(), null, null);
+            List<ImportSessionRow> rows = importSessionRowRepo.getList(realm, skip, limit, filters, null);
 
             ImportRowsResponse response = new ImportRowsResponse();
             response.sessionId = req.sessionId;
@@ -1070,6 +1075,8 @@ public class QueryGatewayResource {
     private static final String ACTION_CREATE = "create";
     private static final String ACTION_UPDATE = "update";
     private static final String ACTION_DELETE = "delete";
+    /** Values ImportSessionRow.intent takes; importRows accepts only these as a filter. */
+    private static final List<String> IMPORT_ROW_INTENTS = List.of("INSERT", "UPDATE", "SKIP");
 
     /** What one gateway operation runs as: resolved once per request. */
     private static final class Access {

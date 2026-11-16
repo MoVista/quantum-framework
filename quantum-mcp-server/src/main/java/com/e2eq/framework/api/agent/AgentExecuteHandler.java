@@ -73,8 +73,11 @@ public class AgentExecuteHandler {
                 // No principal means the SecurityFilter did not run for this call, so any request
                 // still recorded on this thread belongs to an earlier one.
                 SecurityFilter.clearCurrentRequest();
-                SecurityContext.setPrincipalContext(securityFilter.buildPrincipalContextForCurrentIdentity(null));
+                // Take ownership before building: building runs property resolvers whose repository
+                // lookups can set a principal on this thread, and if one then fails, the finally
+                // block must still clear it so the next call on this worker starts empty.
                 establishedContext = true;
+                SecurityContext.setPrincipalContext(securityFilter.buildPrincipalContextForCurrentIdentity(null));
             }
             String action = TOOL_ACTIONS.get(tool);
             if (action != null) {
