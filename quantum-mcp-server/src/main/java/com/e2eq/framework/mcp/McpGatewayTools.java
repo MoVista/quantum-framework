@@ -205,7 +205,7 @@ public class McpGatewayTools {
     String query_export(
             @ToolArg(description = "Entity type (e.g. Location, Order). Use query_rootTypes to discover valid values.") String rootType,
             @ToolArg(description = "Optional BIAPI query to filter exported entities (e.g. 'status:ACTIVE')", required = false) String query,
-            @ToolArg(description = "Optional comma-separated list of columns to include in export (e.g. 'refName,displayName,status')", required = false) String columns,
+            @ToolArg(description = "Comma-separated list of columns to include in export (e.g. 'refName,displayName,status'). Required; the export does not pick columns on its own.") String columns,
             @ToolArg(description = "Optional tenant realm", required = false) String realm,
             @ToolArg(description = "Optional max rows to export (default: all)", required = false) Integer limit,
             @ToolArg(description = "Optional rows to skip (default 0)", required = false) Integer skip) {
