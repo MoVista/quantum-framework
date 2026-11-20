@@ -60,6 +60,8 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Supplier;
+import java.util.regex.Pattern;
 
 
 /**
@@ -231,8 +233,7 @@ public class QueryGatewayResource {
         }
         Integer limit = (req.page != null) ? req.page.limit : null;
         Integer skip = (req.page != null) ? req.page.skip : null;
-        Map<String, String> variableMap = variableMapForQuery(req.realm);
-        PlannedQuery planned = MorphiaUtils.convertToPlannedQuery(req.query, root, limit, skip, sortFields, variableMap);
+        PlannedQuery planned = planQuery(req.query, root, limit, skip, sortFields, () -> variableMapForQuery(req.realm));
         if (planned.getMode() == PlannerResult.Mode.AGGREGATION) {
             if (!aggregationExecutionEnabled) {
                 Map<String, Object> body = new HashMap<>();
@@ -322,8 +323,7 @@ public class QueryGatewayResource {
             return withEntityAccess(root, ACTION_LIST, req.realm, realm -> {
                 Filter filter = null;
                 if (req.query != null && !req.query.isBlank()) {
-                    Map<String, String> variableMap = variableMapForQuery(req.realm);
-                    PlannedQuery planned = MorphiaUtils.convertToPlannedQuery(req.query, root, null, null, null, variableMap);
+                    PlannedQuery planned = planQuery(req.query, root, null, null, null, () -> variableMapForQuery(req.realm));
                     if (planned.getMode() == PlannerResult.Mode.AGGREGATION) {
                         Map<String, Object> error = new HashMap<>();
                         error.put("error", "InvalidQuery");
@@ -569,8 +569,8 @@ public class QueryGatewayResource {
             if (req.query != null && !req.query.isBlank()) {
                 // Variables come from the principal that was authorized for the target realm, not
                 // from the thread context, which may still be the caller's home realm.
-                Map<String, String> variableMap = MorphiaUtils.createStandardVariableMapFrom(access.principal, access.resource);
-                PlannedQuery planned = MorphiaUtils.convertToPlannedQuery(req.query, root, null, null, null, variableMap);
+                PlannedQuery planned = planQuery(req.query, root, null, null, null,
+                        () -> MorphiaUtils.createStandardVariableMapFrom(access.principal, access.resource));
                 if (planned.getMode() == PlannerResult.Mode.AGGREGATION) {
                     Map<String, Object> error = new HashMap<>();
                     error.put("error", "InvalidQuery");
@@ -1000,8 +1000,7 @@ public class QueryGatewayResource {
             // Row count for the threshold decision, through the repo so row-level filters apply
             Filter exportFilter = null;
             if (query != null && !query.isBlank()) {
-                PlannedQuery planned = MorphiaUtils.convertToPlannedQuery(
-                        query, root, null, null, null, variableMapForQuery(req.realm));
+                PlannedQuery planned = planQuery(query, root, null, null, null, () -> variableMapForQuery(req.realm));
                 exportFilter = planned.getFilter();
             }
             long rowCount = securedCount(repo, root, realm, exportFilter, query);
@@ -1056,6 +1055,25 @@ public class QueryGatewayResource {
      * @param requestRealm optional realm from the request (may be null)
      * @return map of variable names to values (never null)
      */
+    /** An ontology predicate in a query; these need the caller's tenant from the variable map. */
+    private static final Pattern ONTOLOGY_PREDICATE = Pattern.compile("\\bhas(?:Edge|OutgoingEdge|IncomingEdge)\\s*\\(");
+
+    /**
+     * Plans a query as entity list endpoints parse theirs, adding the caller's variables only when
+     * the query uses one ({@code ${...}}) or an ontology predicate. With a variable map the parser
+     * turns dates and numbers into text, which then match nothing stored as a date or number.
+     */
+    static PlannedQuery planQuery(String query, Class<? extends UnversionedBaseModel> root, Integer limit,
+                                          Integer skip, List<LogicalPlan.SortSpec.Field> sortFields,
+                                          Supplier<Map<String, String>> variables) {
+        Map<String, String> variableMap = usesQueryVariables(query) ? variables.get() : null;
+        return MorphiaUtils.convertToPlannedQuery(query, root, limit, skip, sortFields, variableMap);
+    }
+
+    static boolean usesQueryVariables(String query) {
+        return query != null && (query.contains("${") || ONTOLOGY_PREDICATE.matcher(query).find());
+    }
+
     private Map<String, String> variableMapForQuery(String requestRealm) {
         java.util.Optional<PrincipalContext> pc = SecurityContext.getPrincipalContext();
         java.util.Optional<ResourceContext> rc = SecurityContext.getResourceContext();
