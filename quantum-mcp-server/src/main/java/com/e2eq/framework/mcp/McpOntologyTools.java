@@ -43,9 +43,9 @@ public class McpOntologyTools {
             + "Each edge includes: predicate, source/destination entity ID and type, and whether it is inferred or derived.")
     String query_relationships(
             @ToolArg(description = "The entity ID to find relationships for (e.g. the refName or ObjectId hex string of the entity)") String entityId,
-            @ToolArg(description = "Direction: 'out' for outgoing edges FROM this entity, 'in' for incoming edges TO this entity, 'both' for all. Default: 'both'") String direction,
-            @ToolArg(description = "Optional predicate filter - only return edges with this predicate (e.g. 'placedInOrg', 'canSeeLocation')") String predicate,
-            @ToolArg(description = "Optional tenant realm. When omitted, derived from the caller's security context.") String realm) {
+            @ToolArg(description = "Direction: 'out' for outgoing edges FROM this entity, 'in' for incoming edges TO this entity, 'both' for all. Default: 'both'", required = false, defaultValue = "both") String direction,
+            @ToolArg(description = "Optional predicate filter - only return edges with this predicate (e.g. 'placedInOrg', 'canSeeLocation')", required = false) String predicate,
+            @ToolArg(description = "Tenant realm to read. Required; this tool does not take the realm from the caller's session.") String realm) {
         try {
             DataDomain dataDomain = resolveDataDomain(realm);
             if (dataDomain == null) {
@@ -94,9 +94,9 @@ public class McpOntologyTools {
             + "Returns predicate name, domain (source type), range (target type), and characteristics "
             + "(transitive, symmetric, functional, inferred). Use this to discover what relationship types exist before querying edges.")
     String query_predicates(
-            @ToolArg(description = "Optional filter: only return predicates where this is the domain (source entity type), e.g. 'Associate'") String domainFilter,
-            @ToolArg(description = "Optional filter: only return predicates where this is the range (target entity type), e.g. 'Location'") String rangeFilter,
-            @ToolArg(description = "Optional tenant realm. When omitted, derived from the caller's security context.") String realm) {
+            @ToolArg(description = "Optional filter: only return predicates where this is the domain (source entity type), e.g. 'Associate'", required = false) String domainFilter,
+            @ToolArg(description = "Optional filter: only return predicates where this is the range (target entity type), e.g. 'Location'", required = false) String rangeFilter,
+            @ToolArg(description = "Tenant realm to read. Required; this tool does not take the realm from the caller's session.") String realm) {
         try {
             String resolvedRealm = resolveRealm(realm);
             OntologyRegistry registry = registryProvider.getRegistryForRealm(resolvedRealm);
