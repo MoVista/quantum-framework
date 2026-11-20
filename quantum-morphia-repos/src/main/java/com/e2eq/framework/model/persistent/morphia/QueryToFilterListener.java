@@ -838,10 +838,8 @@ public class QueryToFilterListener extends BIAPIQueryBaseListener {
 
         if (variableMap != null && value instanceof CommonToken) {
             CommonToken ct = (CommonToken) value;
-            // Only text can hold ${...} variables. A VARIABLE is substituted and coerced in its own
-            // branch, and numbers, dates, ids and references keep their token so they are typed below;
-            // turning them into text here made them match nothing stored as a number or date.
-            if (ct.getType() == BIAPIQueryParser.STRING || ct.getType() == BIAPIQueryParser.QUOTED_STRING) {
+            // Do not pre-substitute VARIABLE here; let the VARIABLE branch handle substitution + coercion
+            if (ct.getType() != BIAPIQueryParser.VARIABLE) {
                 if (sub != null) {
                    value = sub.replace(ct.getText());
                 } else {
